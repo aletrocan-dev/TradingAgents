@@ -37,6 +37,11 @@ _RATING_SET = {r.lower() for r in RATINGS_5_TIER}
 _RATING_LABEL_RE = re.compile(r"rating\b[^:\-\u2010-\u2015]*[:\-\u2010-\u2015][\s*]*(\w+)",
                               re.IGNORECASE)
 
+# A reasoning model in the R1 family ends on \boxed{...}: its own marker
+# for "this is the answer", so it reads as a label rather than as prose. Tolerates
+# a LaTeX wrapper (\boxed{\text{Hold}}) and markdown inside the box.
+_BOXED_RE = re.compile(r"\\boxed\s*\{\s*(?:\\\w+\s*\{\s*)?[*\s]*([A-Za-z]+)")
+
 # A line presenting the scale rather than a decision ("Rating Scale: Buy, ...").
 _RATING_SCALE_RE = re.compile(r"rating\s*(scale|options|legend)", re.IGNORECASE)
 
@@ -49,14 +54,26 @@ _RATING_WORD_RE = re.compile(
 def extract_rating(text: str) -> str | None:
     """Extract a 5-tier rating from prose, or ``None`` if none is present.
 
-    Two-pass strategy on the NFKC-normalized text (so fullwidth punctuation like
-    ``Rating：Overweight`` is matched the same as ASCII):
-    1. An explicit "Rating: X" label (tolerant of markdown bold).
-    2. The first standalone 5-tier rating word found anywhere.
+    Three-pass strategy on the NFKC-normalized text (so fullwidth punctuation
+    like ``Rating：Overweight`` is matched the same as ASCII):
+    1. A ``\boxed{X}`` final answer.
+    2. An explicit "Rating: X" label (tolerant of markdown bold).
+    3. The only standalone 5-tier rating word in the text.
     """
     if not text:
         return None
     norm = unicodedata.normalize("NFKC", text)
+
+    # The boxed answer, taking the last one written. A reasoning model states it
+    # after weighing the alternatives, which is exactly the prose that defeats
+    # pass 3 below. A box holding something that is not a rating (\boxed{SOLD})
+    # decides nothing, so it falls through rather than blocking the other passes.
+    boxed = None
+    for m in _BOXED_RE.finditer(norm):
+        if m.group(1).lower() in _RATING_SET:
+            boxed = m.group(1).capitalize()
+    if boxed:
+        return boxed
 
     # The labelled rating, taking the last one written: a decision states its
     # rating after discussing the alternatives. Lines presenting the scale

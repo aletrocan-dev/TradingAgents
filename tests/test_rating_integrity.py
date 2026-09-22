@@ -209,3 +209,60 @@ def test_a_decision_prompt_states_the_shape_of_its_answer(module, factory, must_
     assert "## Output" in prompt, "no output-format section in the prompt"
     section = prompt.split("## Output", 1)[1]
     assert f"**{must_name}**" in section, section[:300]
+
+
+# --- a reasoning model's boxed final answer ---------------------------------
+
+BOXED_AFTER_DEBATE = (
+    "The aggressive analyst pushed for a Buy, the conservative case argued Sell, "
+    "and a Hold was considered and set aside.\n\n"
+    r"\boxed{Underweight}"
+)
+
+
+@pytest.mark.unit
+def test_a_boxed_answer_is_the_decision():
+    """R1-family models end on \boxed{X}. Without reading it, a decision that
+    weighed every alternative first falls through to REVIEW — the model was
+    explicit and the parser threw the answer away."""
+    assert extract_rating(BOXED_AFTER_DEBATE) == "Underweight"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("boxed, expected", [
+    (r"\boxed{Hold}", "Hold"),
+    (r"\boxed{\text{Hold}}", "Hold"),
+    (r"\boxed{\textbf{Overweight}}", "Overweight"),
+    (r"\boxed{**Sell**}", "Sell"),
+    (r"\boxed{ Buy }", "Buy"),
+    (r"\boxed {Buy}", "Buy"),
+])
+def test_the_box_is_read_through_its_wrappers(boxed, expected):
+    assert extract_rating(f"A long argument.\n\n{boxed}") == expected
+
+
+@pytest.mark.unit
+def test_the_last_box_is_the_one_that_decides():
+    text = r"\boxed{Buy}" + "\n\nOn reflection:\n\n" + r"\boxed{Sell}"
+    assert extract_rating(text) == "Sell"
+
+
+@pytest.mark.unit
+def test_a_box_holding_something_else_decides_nothing():
+    """\boxed{SOLD} is not one of the five tiers, so it must not block the
+    passes below it, nor be bent into the nearest-looking rating."""
+    assert extract_rating("Sell it down.\n" + r"\boxed{SOLD}") == "Sell"
+    assert extract_rating("Buy or Sell, the committee split.\n" + r"\boxed{SOLD}") is None
+
+
+@pytest.mark.unit
+def test_a_boxed_answer_outranks_a_rating_word_argued_earlier():
+    text = "A Buy case was made at length and rejected.\n\n" + r"\boxed{Sell}"
+    assert extract_rating(text) == "Sell"
+
+
+@pytest.mark.unit
+def test_prose_without_a_box_is_read_exactly_as_before():
+    assert extract_rating(INVERTED) == "Underweight"
+    assert extract_rating("The bull wants Buy, the bear wants Sell.") is None
+    assert parse_rating(REFUSAL) == RATING_REVIEW
