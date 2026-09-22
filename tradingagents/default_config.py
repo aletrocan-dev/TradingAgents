@@ -169,7 +169,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
         "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance
         "news_data": "yfinance",             # Options: alpha_vantage, yfinance
         "macro_data": "fred",                # Options: fred (needs FRED_API_KEY)
-        "prediction_markets": "polymarket",  # Options: polymarket (keyless)
+        # Off: this network's ISP resolves gamma-api.polymarket.com to an
+        # address that is not Polymarket's, so every call fails TLS hostname
+        # verification. The block is on DNS only — the route to the real
+        # Cloudflare addresses is open — so a different resolver would restore
+        # it. Set back to "polymarket" to re-enable; an empty entry means the
+        # category is off and its tool is never offered to the news analyst.
+        "prediction_markets": "",  # Options: polymarket (keyless)
     },
     # Tool-level configuration (takes precedence over category-level)
     "tool_vendors": {

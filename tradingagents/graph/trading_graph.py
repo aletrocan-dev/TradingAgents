@@ -31,6 +31,7 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.interface import vendor_configured
 from tradingagents.dataflows.utils import get_current_date, safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
@@ -267,7 +268,10 @@ class TradingAgentsGraph:
                     get_global_news,
                     get_insider_transactions,
                     get_macro_indicators,
-                    get_prediction_markets,
+                    # Mirrors the tools the news analyst is given: a category with
+                    # no vendor is off, and a node for it could never be reached.
+                    *([get_prediction_markets]
+                      if vendor_configured("prediction_markets") else []),
                 ]
             ),
             "fundamentals": ToolNode(

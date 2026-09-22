@@ -176,6 +176,16 @@ def get_vendor(category: str, method: str = None) -> str:
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
 
+def vendor_configured(category: str) -> bool:
+    """Whether a category has a vendor to serve it at all.
+
+    An empty entry means the category is off, and a caller that offers tools to
+    a model asks this first: binding a tool whose category has no vendor spends
+    a tool call, and the round trip of a model discovering that, on every run.
+    """
+    return bool((get_config().get("data_vendors") or {}).get(category))
+
+
 def _is_cacheable(result) -> bool:
     """Whether a routed result may be stored for later runs to reuse.
 
