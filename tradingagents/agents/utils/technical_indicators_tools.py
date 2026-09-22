@@ -3,7 +3,7 @@ from typing import Annotated
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
-from tradingagents.dataflows.date_window import as_of
+from tradingagents.dataflows.date_window import as_of, canonical_span
 from tradingagents.dataflows.interface import route_to_vendor
 
 
@@ -29,6 +29,7 @@ def get_indicators(
     # LLMs sometimes pass multiple indicators as a comma-separated string;
     # split and process each individually.
     curr_date = as_of(curr_date, trade_date)
+    look_back_days = canonical_span(look_back_days, 30)
     indicators = [i.strip().lower() for i in indicator.split(",") if i.strip()]
     results = []
     for ind in indicators:

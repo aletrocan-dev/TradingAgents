@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from . import fetch_issues
+from .config import get_config
 from .utils import get_current_date
 
 
@@ -56,6 +58,10 @@ def coverage_gap(
         reason = f"it only serves recent items (coverage starts {oldest:%Y-%m-%d})"
     else:
         return None
+    # A feed that never observed the window is an unavailability the run should
+    # be able to see afterwards. It reaches the agent as an ordinary return
+    # value, not through the router's error paths, so it is reported here.
+    fetch_issues.record(source, "no_coverage", f"{start_date}..{end_date}: {reason}")
     return f"<{source} unavailable for {start_date}..{end_date}: {reason}, so this is not an absence of {subject}>"
 
 
@@ -90,6 +96,30 @@ def as_of_window(start_date: str, end_date: str, trade_date: str) -> tuple[str, 
         return start_date, end
     span = (old_end - start) if old_end is not None and old_end >= start else timedelta(0)
     return f"{_parse(end) - span:%Y-%m-%d}", end
+
+
+def canonical_span(requested, default):
+    """A window length: the model's own, or the run's fixed one.
+
+    An evaluation run pins every span so two models are asked the same
+    question: one that requests 29 days of news simply has more information
+    than one that requests 7, which would read as the better reasoner. A live
+    run leaves the choice alone — deciding how far back to look is part of the
+    analysis, and only a comparison needs it held still.
+    """
+    return default if get_config().get("canonical_tool_windows") else requested
+
+
+def canonical_window(
+    start_date: str, end_date: str, trade_date: str, span_days: int
+) -> tuple[str, str]:
+    """``as_of_window``, with the start pinned ``span_days`` before the end when
+    the run asks for canonical windows."""
+    start, end = as_of_window(start_date, end_date, trade_date)
+    end_dt = _parse(end)
+    if not get_config().get("canonical_tool_windows") or end_dt is None:
+        return start, end
+    return f"{end_dt - timedelta(days=span_days):%Y-%m-%d}", end
 
 
 def withhold_live_profile(curr_date: str | None, label: str) -> str | None:

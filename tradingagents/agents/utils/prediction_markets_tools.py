@@ -3,6 +3,7 @@ from typing import Annotated
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
+from tradingagents.dataflows.date_window import canonical_span
 from tradingagents.dataflows.interface import route_to_vendor
 
 
@@ -30,4 +31,6 @@ def get_prediction_markets(
     Returns:
         str: A formatted markdown report of matching prediction markets
     """
-    return route_to_vendor("get_prediction_markets", topic, limit, trade_date or None)
+    return route_to_vendor(
+        "get_prediction_markets", topic, canonical_span(limit, None), trade_date or None,
+    )

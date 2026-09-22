@@ -3,7 +3,8 @@ from typing import Annotated
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
-from tradingagents.dataflows.date_window import as_of_window
+from tradingagents.dataflows.config import get_config
+from tradingagents.dataflows.date_window import canonical_window
 from tradingagents.dataflows.interface import route_to_vendor
 
 
@@ -24,5 +25,7 @@ def get_stock_data(
     Returns:
         str: A formatted dataframe containing the stock price data for the specified ticker symbol in the specified date range.
     """
-    start_date, end_date = as_of_window(start_date, end_date, trade_date)
+    start_date, end_date = canonical_window(
+        start_date, end_date, trade_date, get_config()["price_lookback_days"]
+    )
     return route_to_vendor("get_stock_data", symbol, start_date, end_date)

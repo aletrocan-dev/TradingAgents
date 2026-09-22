@@ -1,5 +1,6 @@
 import logging
 
+from . import fetch_cache, fetch_issues
 from .alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
     get_cashflow as get_alpha_vantage_cashflow,
@@ -14,6 +15,7 @@ from .alpha_vantage import (
 from .config import get_config
 from .errors import (
     NoMarketDataError,
+    VendorError,
     VendorNotConfiguredError,
     VendorRateLimitError,
 )
@@ -174,7 +176,51 @@ def get_vendor(category: str, method: str = None) -> str:
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
 
+def _is_cacheable(result) -> bool:
+    """Whether a routed result may be stored for later runs to reuse.
+
+    The degraded verdicts below are what this router returns when no vendor
+    could serve the call — usually a throttle or an outage, which the next run
+    would get past. Storing one would serve that failure to every later run of
+    the cell instead, exactly the poisoned-cache problem the OHLCV cache guards
+    against. They are reported as fetch issues instead, so a cell that ran on
+    degraded data is visible and can be re-run.
+    """
+    return isinstance(result, str) and not result.startswith(
+        ("NO_DATA_AVAILABLE:", "DATA_UNAVAILABLE:")
+    )
+
+
+def _error_reason(error: Exception) -> str:
+    """Tell a malformed call apart from a broken vendor.
+
+    A model that invents an argument (an indicator name that does not exist,
+    say) gets a plain ``ValueError`` back, recovers from the message, and calls
+    again — reporting that beside an outage would bury the outages. A
+    ``VendorError`` is excluded because it is the vendor speaking, not the
+    caller, even where it is also a ``ValueError``.
+    """
+    if isinstance(error, ValueError) and not isinstance(error, VendorError):
+        return "unsupported_request"
+    return "error"
+
+
 def route_to_vendor(method: str, *args, **kwargs):
+    """Route a tool call to its vendor(s), transparently caching the result.
+
+    Caching is opt-in via ``config["cache_tool_fetches"]`` (set by
+    ``run_backtest`` so a re-run — same or different model — reads the same
+    fetched input instead of hitting live vendors again; off by default so
+    interactive/live runs always see fresh data).
+    """
+    return fetch_cache.cached_call(
+        method, args, kwargs, get_config(),
+        lambda: _route_to_vendor_uncached(method, *args, **kwargs),
+        cacheable=_is_cacheable,
+    )
+
+
+def _route_to_vendor_uncached(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
     vendor_config = get_vendor(category, method)
@@ -252,6 +298,7 @@ def route_to_vendor(method: str, *args, **kwargs):
         # stale") so the agent sees the specific reason — invalid symbol, no
         # coverage, or stale data — not just a generic "unavailable".
         reason = f" ({last_no_data.detail})" if last_no_data.detail else ""
+        fetch_issues.record(method, "no_data", f"{sym}{resolved}{reason}", args)
         return (
             f"NO_DATA_AVAILABLE: No usable market data for '{sym}'{resolved} from "
             f"any configured vendor{reason}. The symbol may be invalid, delisted, "
@@ -266,6 +313,7 @@ def route_to_vendor(method: str, *args, **kwargs):
     # Every vendor was throttled or unreachable: that is a fact about the
     # vendors, not about the instrument, and it must not end the run.
     if last_unavailable is not None:
+        fetch_issues.record(method, "vendor_unavailable", str(last_unavailable), args)
         return (
             f"DATA_UNAVAILABLE: no configured vendor could serve {method} right now "
             f"({last_unavailable}). This says nothing about the instrument; report the "
@@ -275,10 +323,13 @@ def route_to_vendor(method: str, *args, **kwargs):
     if first_error is not None:
         if category in OPTIONAL_CATEGORIES:
             logger.warning("Optional %s unavailable for %s: %s", category, method, first_error)
+            fetch_issues.record(method, "vendor_unavailable", str(first_error), args)
             return (
                 f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
                 f"({first_error}). Proceed without it; do not fabricate values."
             )
+        fetch_issues.record(method, _error_reason(first_error), str(first_error), args)
         raise first_error
 
+    fetch_issues.record(method, "error", "no vendor available", args)
     raise RuntimeError(f"No available vendor for '{method}'")

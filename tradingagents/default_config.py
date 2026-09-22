@@ -20,6 +20,8 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
     "TRADINGAGENTS_MAX_TOKENS":           "max_tokens",
+    "TRADINGAGENTS_CACHE_TOOL_FETCHES":   "cache_tool_fetches",
+    "TRADINGAGENTS_CANONICAL_WINDOWS":    "canonical_tool_windows",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
     # interactive choice, which is skipped when the matching var is set.
@@ -109,6 +111,20 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Checkpoint/resume: when True, LangGraph saves state after each node
     # so a crashed run can resume from the last successful step.
     "checkpoint_enabled": False,
+    # When True, every data-vendor tool call (news, OHLCV, fundamentals, macro,
+    # ...) is cached under data_cache_dir/fetch_cache, keyed on the exact call
+    # signature and never on the LLM/provider, so a re-run — even with a
+    # different model, even weeks later — reads the identical fetched input
+    # instead of hitting live vendors again. Off by default so interactive/live
+    # runs always see fresh data; run_backtest() turns it on for its own runs.
+    "cache_tool_fetches": False,
+    # When True, tools ignore the window length the model asked for and use the
+    # run's fixed one (below), so two models are compared on the same question
+    # rather than on who looked further back. Off by default: a single live run
+    # is the product and decides its own windows; run_backtest() turns it on.
+    "canonical_tool_windows": False,
+    "news_lookback_days": 7,      # ticker-news window under canonical_tool_windows
+    "price_lookback_days": 90,    # OHLCV window under canonical_tool_windows
     # Output language for analyst reports and final decision
     # Internal agent debate stays in English for reasoning quality
     "output_language": "English",

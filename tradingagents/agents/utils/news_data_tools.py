@@ -3,7 +3,8 @@ from typing import Annotated
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
-from tradingagents.dataflows.date_window import as_of, as_of_window
+from tradingagents.dataflows.config import get_config
+from tradingagents.dataflows.date_window import as_of, canonical_span, canonical_window
 from tradingagents.dataflows.interface import route_to_vendor
 
 
@@ -24,7 +25,9 @@ def get_news(
     Returns:
         str: A formatted string containing news data
     """
-    start_date, end_date = as_of_window(start_date, end_date, trade_date)
+    start_date, end_date = canonical_window(
+        start_date, end_date, trade_date, get_config()["news_lookback_days"]
+    )
     return route_to_vendor("get_news", ticker, start_date, end_date)
 
 @tool
@@ -48,7 +51,10 @@ def get_global_news(
     Returns:
         str: A formatted string containing global news data
     """
-    return route_to_vendor("get_global_news", as_of(curr_date, trade_date), look_back_days, limit)
+    return route_to_vendor(
+        "get_global_news", as_of(curr_date, trade_date),
+        canonical_span(look_back_days, None), canonical_span(limit, None),
+    )
 
 @tool
 def get_insider_transactions(
