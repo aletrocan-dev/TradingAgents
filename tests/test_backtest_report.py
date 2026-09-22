@@ -164,11 +164,11 @@ def test_distinct_problems_on_the_same_tool_stay_separate(tmp_path):
 
 @pytest.mark.unit
 def test_an_invented_argument_is_not_dressed_as_an_outage(tmp_path):
-    """The model recovers from it on the next call; colouring it like a broken
+    """The model recovers from it on the next call; painting it like a broken
     vendor would bury the real failures."""
-    from tradingagents.backtest_report import _REASON_COLORS
+    from tradingagents.backtest_report import _reason_color
 
-    assert _REASON_COLORS["unsupported_request"] != _REASON_COLORS["error"]
+    assert _reason_color("unsupported_request") != _reason_color("error")
     result = _result(tmp_path, fetch_issues=[{
         "ticker": "NVDA", "date": "2026-01-05", "method": "get_indicators",
         "reason": "unsupported_request", "detail": "Indicator vwap is not supported",
@@ -177,7 +177,7 @@ def test_an_invented_argument_is_not_dressed_as_an_outage(tmp_path):
     html = write_html_report(
         result, _summary(), [_ENTRY], {"llm_provider": "openai"}
     ).read_text(encoding="utf-8")
-    assert _REASON_COLORS["unsupported_request"] in html
+    assert _reason_color("unsupported_request") in html
 
 
 @pytest.mark.unit
@@ -215,12 +215,28 @@ def test_the_chart_marks_what_each_decision_did(tmp_path):
         _result(tmp_path, curves=[curve]), _summary(), [_ENTRY], {"llm_provider": "openai"}
     ).read_text(encoding="utf-8")
 
-    assert "2026-01-01: Buy" in html      # tooltip sul pallino
+    assert "2026-01-01: Buy" in html      # tooltip sul marcatore
     assert "2026-01-03: Sell" in html
-    assert "fill='#2f9e44'" in html       # compra = verde
-    assert "fill='#e03131'" in html       # vendi = rosso
-    assert "fill='none'" in html          # REVIEW = pallino vuoto
+    assert "var(--dir-up)" in html and "var(--dir-down)" in html
+    assert "fill='none'" in html          # REVIEW = marcatore vuoto
     assert "compra" in html and "vendi" in html and "mantiene" in html
+
+
+@pytest.mark.unit
+def test_direction_is_carried_by_shape_and_not_by_colour_alone():
+    """Green and red measure DeltaE 7.2 apart under protanopia, which the palette
+    validator only allows with a second channel — here, the marker's shape."""
+    from tradingagents.backtest_report import _marker_shape
+
+    up = _marker_shape("Buy", 10, 10, "var(--dir-up)")
+    down = _marker_shape("Sell", 10, 10, "var(--dir-down)")
+    flat = _marker_shape("Hold", 10, 10, "var(--dir-flat)")
+    review = _marker_shape("REVIEW", 10, 10, "var(--dir-unknown)")
+
+    assert "polygon" in up and "polygon" in down
+    assert up.split("points=")[1] != down.split("points=")[1]   # su vs giu'
+    assert "circle" in flat and "fill='none'" not in flat
+    assert "fill='none'" in review                              # vuoto: niente deciso
 
 
 @pytest.mark.unit
@@ -239,3 +255,19 @@ def test_the_chart_states_how_long_the_backtest_ran(tmp_path):
     assert "3 giorni di prezzo" in html
     assert "2026-01-01" in html and "2026-01-03" in html
     assert "1 decisioni" in html
+
+
+@pytest.mark.unit
+def test_every_decision_is_listed_with_its_outcome(tmp_path):
+    """The report should say what happened, not only summarise it."""
+    pending = {**_ENTRY, "date": "2026-01-12", "pending": True, "raw": None, "alpha": None}
+    review = {**_ENTRY, "date": "2026-01-19", "rating": "REVIEW"}
+    html = write_html_report(
+        _result(tmp_path), _summary(), [_ENTRY, pending, review], {"llm_provider": "openai"}
+    ).read_text(encoding="utf-8")
+
+    for date in ("2026-01-05", "2026-01-12", "2026-01-19"):
+        assert date in html
+    assert "+4.0%" in html            # l'alpha della cella risolta
+    assert "in attesa" in html        # la pending si distingue
+    assert "non valutabile" in html   # e la REVIEW pure
