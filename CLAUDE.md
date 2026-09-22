@@ -1,0 +1,86 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+TradingAgents is a multi-agent LLM trading-research framework built on LangGraph. Specialized agents (analysts → researchers → trader → risk management → portfolio manager) run as a graph over a shared `AgentState`, collaboratively producing a trade decision for a ticker/date. It ships both as a Python package (`tradingagents`) and an interactive CLI (`cli`, entry point `tradingagents`).
+
+## Commands
+
+```bash
+pip install -e ".[dev]"        # editable install with dev extras (ruff, pytest)
+
+pytest -q                      # full test suite
+pytest tests/test_backtest.py  # single test file
+pytest tests/test_backtest.py::test_name -q   # single test
+pytest -m unit                 # marker-filtered run (markers: unit, integration, smoke)
+
+ruff check .                   # lint (CI runs this on the whole repo, strict)
+
+tradingagents                  # launch interactive CLI (installed command)
+python -m cli.main             # same, run from source
+tradingagents backtest NVDA,AAPL --start 2026-06-01 --end 2026-08-01 --every 7
+```
+
+CI (`.github/workflows/ci.yml`) runs pytest across Python 3.10–3.13, a clean-install import smoke test, and `ruff check .` on the full repo — keep new code lint-clean rather than relying on suppressions.
+
+Tests never make live LLM/network calls: `tests/conftest.py` autouses a `_dummy_api_keys` fixture (fills every provider API key env var with a placeholder) and an `_isolate_config` fixture (resets the global dataflows config before/after each test, since `set_config` merges and would otherwise leak between tests). Use the `mock_llm_client` fixture to stub `create_llm_client` in graph-level tests.
+
+## Architecture
+
+### Agent graph (`tradingagents/graph/`)
+
+`TradingAgentsGraph` (`trading_graph.py`) is the orchestrator. It builds two LLM clients per run — `deep_thinking_llm` (complex reasoning: Research Manager, Portfolio Manager) and `quick_thinking_llm` (everything else) — then hands them to `GraphSetup` (`setup.py`), which wires a LangGraph `StateGraph(AgentState)`:
+
+1. **Analysts** (`agents/analysts/`, subset selected via `selected_analysts`): market, social (sentiment), news, fundamentals. Each runs as `analyst → tool_node → analyst → ... → clear_messages`, looped via a per-analyst conditional edge (`should_continue_<key>` in `conditional_logic.py`) until the analyst stops calling tools. The exact node sequence and edges are assembled dynamically by `analyst_execution.build_analyst_execution_plan` from whichever analysts are selected — not hardcoded — so adding/removing an analyst from `selected_analysts` reshapes the graph.
+2. **Researcher debate**: Bull vs Bear researcher loop for `max_debate_rounds`, judged by the Research Manager.
+3. **Trader** turns the research plan into a proposed trade.
+4. **Risk debate**: Aggressive/Conservative/Neutral risk analysts loop for `max_risk_discuss_rounds`.
+5. **Portfolio Manager** issues the final decision (one of 5 tiers: Buy/Overweight/Hold/Underweight/Sell, or `"REVIEW"` when unparseable — check with `tradingagents.agents.utils.rating.is_review`).
+
+Both debate/risk conditional edges route through a shared, exhaustive `path_map` (`DEBATE_PATH_MAP`, `RISK_ANALYSIS_PATH_MAP`) so a router fall-through can never hit a missing LangGraph edge.
+
+Supporting pieces in `graph/`: `conditional_logic.py` (loop-continuation predicates), `propagation.py` (builds the initial `AgentState`), `reflection.py` (post-hoc reflection on realized returns, used by the decision log), `signal_processing.py` (extracts the rating from the final decision text), `checkpointer.py` (LangGraph SqliteSaver wiring for `--checkpoint`).
+
+### Tools and data vendors (`tradingagents/dataflows/`, `tradingagents/agents/utils/`)
+
+Agents call LangChain tools defined in `agents/utils/*_tools.py` (e.g. `core_stock_tools.py`, `fundamental_data_tools.py`, `news_data_tools.py`, `macro_data_tools.py`). Each tool resolves to one or more vendor-specific implementations in `dataflows/` (`y_finance.py`, `alpha_vantage*.py`, `sec_edgar.py`, `fred.py`, `polymarket.py`, `reddit.py`, `stocktwits.py`). `dataflows/interface.py` is the routing layer: `TOOLS_CATEGORIES` maps each category (`core_stock_apis`, `fundamental_data`, `news_data`, `macro_data`, `prediction_markets`, `technical_indicators`) to its tools, and `config["data_vendors"]` / `config["tool_vendors"]` (tool-level overrides win) pick which vendor(s) actually serve each call — as an ordered fallback chain when a category lists several (e.g. `"sec_edgar,yfinance"`). Nothing is silently routed to an unconfigured vendor.
+
+`route_to_vendor(method, *args, **kwargs)` is the single chokepoint every one of those tools funnels through, which two cross-cutting layers hang off of:
+
+- `dataflows/fetch_cache.py` — a read-through cache, opt-in via `config["cache_tool_fetches"]` (off for live runs; `run_backtest()` turns it on). Entries live under the shared `data_cache_dir/fetch_cache/`, keyed on the exact call signature and never on the model/provider, with no TTL, so a sweep re-run — different model, weeks later — reads identical fetched input instead of re-hitting live vendors. `interface._is_cacheable` keeps the router's `NO_DATA_AVAILABLE:`/`DATA_UNAVAILABLE:` verdicts *out* of the cache: those usually mean a throttle or outage, and storing one would serve that failure to every later run of the cell. `get_verified_market_snapshot` caches through the same helper despite not being vendor-routed, because the OHLCV download beneath it is refreshed daily (`stockstats_utils._cache_is_fresh` only trusts a file written today) and split/dividend re-adjustment moves historical closes.
+- `date_window.canonical_span` / `canonical_window` — under `config["canonical_tool_windows"]`, tools ignore the window length the model asked for and use the configured one (`news_lookback_days`, `price_lookback_days`, or each tool's own default; `None` where that means "use the vendor/config default"). This makes two models answer the same question instead of differing on who looked further back, and it makes their cache keys collide by construction. Off by default and deliberately sweep-only — a single live run is the product and chooses its own windows; only `run_backtest()` turns it on. The look-ahead clamp in `as_of`/`as_of_window` applies either way.
+- `dataflows/fetch_issues.py` — a `ContextVar`-based `FetchIssueCollector` recording anything that did not resolve cleanly, under one of five reasons: `no_data`, `vendor_unavailable`, `error`, `unsupported_request` (`interface._error_reason` files a plain `ValueError` from a vendor as a malformed call — a model inventing an indicator name recovers from it, and filing it as an outage would bury the real ones), and `no_coverage` from `date_window.coverage_gap` (news/social feeds report an unobserved window as an ordinary return value, so it reaches no error path). Each issue is tagged with whichever `(ticker, date)` cell `run_backtest()` is currently inside, and is always logged, so a degraded fetch is visible live even outside a backtest.
+
+Data correctness invariants worth knowing before touching this layer:
+- **Point-in-time / look-ahead safety**: date-scoped fetches must never leak data from after the requested `trade_date` (see `dataflows/date_window.py`, and the several `test_*_lookahead.py` / `test_*_pointintime.py` tests). SEC EDGAR fundamentals are served "as filed" — a restated figure still reads as first reported for a run dated before the restatement.
+- **Instrument identity**: `agents/utils/agent_utils.resolve_instrument_identity` + `build_instrument_context` deterministically resolve the ticker to a real company/instrument once per run and inject that into every agent's context, so agents can't hallucinate a different company from the price chart.
+- **Symbol normalization**: `dataflows/symbol_utils.normalize_symbol` canonicalizes tickers (e.g. commodity aliases like `XAUUSD` → `GC=F`) before any price lookup, including the benchmark used for alpha.
+- **Path safety**: any ticker used in a filesystem path (cache, results, checkpoints) must go through `dataflows/utils.safe_ticker_component`, which rejects traversal characters — tickers can originate from LLM tool calls, which are attacker-influenceable via prompt injection in fetched content.
+
+### LLM providers (`tradingagents/llm_clients/`)
+
+`factory.create_llm_client(provider, model, base_url, **kwargs)` is the single entry point; provider modules are imported lazily so importing the factory never pulls in unused SDKs. Anthropic, Google, Azure, and Bedrock have dedicated clients; everything else (OpenAI, DeepSeek, Qwen/DashScope, GLM/Zhipu, MiniMax, OpenRouter, Mistral, Kimi/Moonshot, Groq, NVIDIA, Ollama, and any custom OpenAI-compatible endpoint) routes through `openai_client.py`'s provider registry. `model_catalog.py` holds the curated model lists the CLI offers per provider; any model ID a provider serves is still accepted even if not listed. `capabilities.py` / `validators.py` handle provider-specific quirks (e.g. reasoning-effort knobs, which are forwarded via `TradingAgentsGraph._get_provider_kwargs`: `google_thinking_level`, `openai_reasoning_effort`, `anthropic_effort`, plus cross-provider `temperature`, `llm_max_retries`, `max_tokens`).
+
+### Configuration (`tradingagents/default_config.py`, `tradingagents/dataflows/config.py`)
+
+`DEFAULT_CONFIG` is a single dict covering LLM provider/model, debate/risk depth, data vendor routing, benchmark mapping, and paths under `~/.tradingagents/`. It is env-overridable via `TRADINGAGENTS_*` vars (see `_ENV_OVERRIDES`); adding a new overridable key means adding one row there, no other plumbing. `dataflows/config.py` holds a process-global copy set via `set_config()`, which merges one level deep for dict-valued keys (e.g. partial `data_vendors` overrides keep unset categories at their default) — this is why tests reset it between runs.
+
+### Persistence
+
+- **Decision log** (always on): `agents/utils/memory.py`'s `TradingMemoryLog` appends every completed run's decision to `~/.tradingagents/memory/trading_memory.md`. On the next run for the same ticker, pending entries are resolved against realized (and alpha) returns and turned into a one-paragraph reflection injected into the Portfolio Manager's prompt. `TradingAgentsGraph._resolve_pending_entries` / `_fetch_returns` drive this; `_memory_as_of` enforces the point-in-time cutoff for backtests so a historical run only sees lessons that had already resolved by its trade date.
+- **Checkpoint resume** (opt-in, `--checkpoint` / `config["checkpoint_enabled"]`): per-ticker SQLite via LangGraph's SqliteSaver (`graph/checkpointer.py`). The checkpoint thread ID is keyed on a "run signature" (`TradingAgentsGraph._run_signature`: selected analysts, debate/risk depth, asset type, portfolio fingerprint) so a resume under a different graph shape starts fresh instead of silently continuing stale state.
+- **Strategy vs buy & hold** (`tradingagents/strategy_curve.py`): reads a finished sweep's decisions as a position series and compares it to holding the asset — the backtest's headline answer. Deliberately outside `backtest.py`, whose scope note refuses to grow a portfolio simulator: nothing here feeds the evaluation engine. It is one reading under stated assumptions (`config["strategy_positions"]` maps a rating to a weight, sell-side style so Hold is neutral weight *in* the market; a decision acts at its own close; `strategy_cost_bps` charges turnover; `REVIEW` keeps the position), and the report prints those assumptions beside the numbers. One curve per ticker — combining them would need portfolio weights, which is what this does not model.
+- **Backtesting** (`tradingagents/backtest.py`): `run_backtest` sweeps a ticker × date grid through the same pipeline into its own decision log, resumable via `run_id` (already-run cells are skipped). `cache_fetches` and `canonical_windows` (both default on, both sweep-only) are what make two sweeps with different models comparable: the same fetched bytes, and the same window asked of each. `BacktestResult.fetch_issues` collects every degraded/failed fetch (one `collector.cell(ticker, date)` per cell). `TradingAgentsGraph.scoring_metric` picks whether the per-rating table scores `alpha` or `raw`: `benchmark_map` keys on a ticker's *exchange suffix*, so a benchmark ETF resolves to itself (alpha identically zero, every directional call scoring as wrong) and no equity index is a market for crypto — both fall back to the raw return, and `BacktestSummary.metric` names which was used. At the end, `backtest_report.write_html_report` writes a self-contained `report.html` (inline SVG charts, no external assets) next to the run's `trading_memory.md`, with the path on `BacktestResult.report_path`; report generation is wrapped so a formatting bug can never discard a sweep that already cost hours of LLM calls.
+
+### CLI (`cli/`)
+
+`cli/main.py` is the Typer app (`tradingagents` entry point). `cli/config.py` and `cli/prefs.py` handle interactive prompts and persisting the previous run's answers as defaults; `TRADINGAGENTS_*` env vars skip their corresponding prompt entirely. `cli/models.py` surfaces the curated per-provider model catalog to the picker. The CLI auto-detects `asset_type` (stock vs crypto) from the ticker and accepts a portfolio via `--portfolio <file.json>` (same schema as `tradingagents.portfolio.PortfolioContext`).
+
+## Conventions
+
+- Ruff select set is `E, W, F, I, B, UP, C4, SIM` with `E501` (line length) ignored; formatter-owned layout rules are deferred repo-wide until further notice — don't hand-wrap lines to satisfy a formatter that isn't enforced yet.
+- Provider/vendor modules are imported lazily inside functions, not at module top level, specifically to keep `import tradingagents` cheap and to avoid requiring every optional SDK (e.g. `langchain-aws` for Bedrock is an extra, not a core dependency).
+- Config dicts merge one level deep (see `dataflows/config.set_config`); don't assume a partial override clears sibling keys.
+- Many correctness fixes reference GitHub issue numbers in comments (e.g. `#1251`, `#1089`) — these describe *why* a piece of point-in-time/graph-shape/path-safety logic exists and are worth reading before changing that code.
