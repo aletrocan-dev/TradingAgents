@@ -38,7 +38,7 @@ def test_options_still_parse_without_a_subcommand(runner):
 def test_backtest_does_not_also_run_an_analysis(runner, monkeypatch, tmp_path):
     swept = []
     monkeypatch.setattr(m, "run_backtest", lambda *a, **kw: swept.append((a, kw)) or _Result(tmp_path))
-    monkeypatch.setattr(m, "summarize", lambda log: _Summary())
+    monkeypatch.setattr(m, "summarize", lambda log, metric="alpha": _Summary())
 
     result = runner.invoke(m.app, ["backtest", "NVDA,AAPL", "--start", "2026-06-01",
                                    "--end", "2026-06-15", "--every", "7"])
@@ -71,6 +71,10 @@ class _Result:
         self.skipped = 0
         self.failures = []
         self.settlement_failures = []
+        self.fetch_issues = []
+        self.report_path = tmp_path / "report.html"
+        self.curves = []
+        self.metric = "alpha"
 
 
 class _Summary:
@@ -117,7 +121,7 @@ def test_backtest_can_continue_an_interrupted_sweep(runner, monkeypatch, tmp_pat
     """Resuming is what makes a long sweep practical, and the Python API has it."""
     swept = []
     monkeypatch.setattr(m, "run_backtest", lambda *a, **kw: swept.append(kw) or _Result(tmp_path))
-    monkeypatch.setattr(m, "summarize", lambda log: _Summary())
+    monkeypatch.setattr(m, "summarize", lambda log, metric="alpha": _Summary())
 
     result = runner.invoke(m.app, ["backtest", "NVDA", "--start", "2026-06-01",
                                    "--end", "2026-06-08", "--run-id", "20260617_120000"])

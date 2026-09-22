@@ -23,8 +23,11 @@ from pathlib import Path
 
 from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.agents.utils.rating import RATING_REVIEW
+from tradingagents.backtest_report import write_html_report
+from tradingagents.dataflows import fetch_issues
 from tradingagents.dataflows.utils import get_current_date, safe_ticker_component
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.strategy_curve import StrategyCurve, build_curves
 
 logger = logging.getLogger(__name__)
 
@@ -60,17 +63,38 @@ def _canonical(date: str) -> datetime:
     return parsed
 
 
-def _alpha(entry: dict) -> float | None:
-    """Alpha return of a settled entry, or None when it has not settled.
+def _outcome(entry: dict, metric: str = "alpha") -> float | None:
+    """A settled entry's outcome under ``metric``, or None when it has not settled.
 
-    The log stores it as a percentage rounded to one decimal, so aggregates here
-    are accurate to 0.1 of a percentage point, not to the raw quote.
+    The log stores both the raw and the alpha return as a percentage rounded to
+    one decimal, so aggregates here are accurate to 0.1 of a percentage point,
+    not to the raw quote.
     """
-    text = (entry.get("alpha") or "").strip().rstrip("%")
+    text = (entry.get(metric) or "").strip().rstrip("%")
     try:
         return float(text) / 100
     except ValueError:
         return None
+
+
+def _grid_holding_days(dates: list[str], asset_type: str) -> int | None:
+    """Bars a decision owns before the next one supersedes it, or ``None`` when
+    the grid is uneven and no single horizon describes it.
+
+    ``_fetch_returns`` counts bars, and the grid steps calendar days: crypto
+    prints a bar every day, so the two coincide, while an equity prints five a
+    week and a seven-day step is five bars.
+    """
+    if len(dates) < 2:
+        return None
+    gaps = {
+        (datetime.strptime(b, "%Y-%m-%d") - datetime.strptime(a, "%Y-%m-%d")).days
+        for a, b in zip(dates, dates[1:], strict=False)
+    }
+    if len(gaps) != 1:
+        return None
+    gap = gaps.pop()
+    return max(1, gap if asset_type == "crypto" else round(gap * 5 / 7))
 
 
 @dataclass
@@ -81,6 +105,15 @@ class BacktestResult:
     skipped: int = 0
     failures: list[tuple[str, str, str]] = field(default_factory=list)
     settlement_failures: list[tuple[str, str]] = field(default_factory=list)
+    # Data fetches that degraded to "no data"/"vendor unavailable" or errored,
+    # one dict per occurrence (see tradingagents.dataflows.fetch_issues).
+    fetch_issues: list[dict] = field(default_factory=list)
+    # One per ticker: following the decisions, against holding the asset.
+    curves: list[StrategyCurve] = field(default_factory=list)
+    # Which outcome the sweep is scored on; see TradingAgentsGraph.scoring_metric.
+    metric: str = "alpha"
+    # Set once write_html_report() has run at the end of run_backtest().
+    report_path: Path | None = None
 
 
 # What each rating claims will happen, so an outcome can be scored against it.
@@ -92,7 +125,7 @@ _DIRECTION = {"Buy": 1, "Overweight": 1, "Hold": 0, "Underweight": -1, "Sell": -
 class RatingScore:
     count: int
     hit_rate: float | None
-    mean_alpha: float
+    mean_value: float   # alpha or raw return, per BacktestSummary.metric
 
 
 @dataclass
@@ -102,22 +135,27 @@ class BacktestSummary:
     by_rating: dict[str, RatingScore]
     unscored: int = 0
     holding: str = ""
+    # Which outcome the scores above are computed on. Two reports are only
+    # comparable when this matches, so render() and the HTML both name it.
+    metric: str = "alpha"
 
     def render(self) -> str:
         lines = [f"Resolved cells: {self.resolved} · pending: {self.pending}"
                  + (f" · unscored: {self.unscored}" if self.unscored else "")]
+        label = "alpha" if self.metric == "alpha" else "return"
+        against = " vs the benchmark" if self.metric == "alpha" else ""
         for rating, score in self.by_rating.items():
             called = (f"called the direction {score.hit_rate:.0%}"
                       if score.hit_rate is not None else "no direction claimed")
             lines.append(
                 f"- {rating}: n={score.count}, {called}, "
-                f"mean alpha {score.mean_alpha:+.2%} vs the benchmark"
+                f"mean {label} {score.mean_value:+.2%}{against}"
             )
         lines.append("")
         if self.pending:
             lines.append("Pending cells are not scored above; re-run to settle them.")
         lines.append(
-            f"Alpha is measured over {self.holding} after each analysis date. "
+            f"{label.capitalize()} is measured over {self.holding} after each analysis date. "
             "One model sampling per cell, and text feeds are not archived, so "
             "these figures are indicative rather than repeatable."
         )
@@ -132,12 +170,32 @@ def run_backtest(
     portfolio=None,
     selected_analysts=("market", "social", "news", "fundamentals"),
     run_id: str | None = None,
+    cache_fetches: bool = True,
+    canonical_windows: bool = True,
 ) -> BacktestResult:
     """Analyze every ticker on every date, into a decision log of this run's own.
 
     The live log stays untouched: a sweep would otherwise flood the context that
     real runs read back. Cells already in this run's log are skipped, so an
     interrupted sweep resumes by being run again.
+
+    ``cache_fetches`` (default on) caches every data-vendor tool call under the
+    shared ``data_cache_dir`` (not per-run_id), keyed on the exact call and
+    never on the model/provider, so a later sweep over the same cells — with a
+    different model, even run weeks apart — reads identical inputs instead of
+    re-hitting live vendors (news/social included). Fetch failures/unavailable
+    data are collected into the result regardless of this flag.
+
+    ``canonical_windows`` (default on) pins every tool's window length to the
+    configured one, so two models are compared on the same question rather than
+    on which one asked to look further back. It is deliberately a sweep-only
+    setting: a single live run is the product and chooses its own windows.
+
+    The horizon each decision is judged over is taken from the grid rather than
+    from ``holding_period_days``: the next cell supersedes the previous decision,
+    so the gap between them is how long that decision actually stood. Judging a
+    sweep stepping two days over a five-day window would score a position the
+    strategy never held. The configured value still governs live runs.
     """
     # run_id becomes a path segment, so it is validated like a ticker: an
     # absolute or dotted value would otherwise place the run outside results_dir.
@@ -145,51 +203,83 @@ def run_backtest(
     run_dir = Path(config["results_dir"]) / "backtest" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     run_config = {**config, "results_dir": str(run_dir),
-                  "memory_log_path": str(run_dir / "trading_memory.md")}
+                  "memory_log_path": str(run_dir / "trading_memory.md"),
+                  "cache_tool_fetches": cache_fetches,
+                  "canonical_tool_windows": canonical_windows}
+    holding = _grid_holding_days(dates, asset_type)
+    if holding is not None:
+        run_config["holding_period_days"] = holding
 
     graph = TradingAgentsGraph(selected_analysts, config=run_config)
     result = BacktestResult(run_id=run_id, log_path=Path(run_config["memory_log_path"]))
     done = {(e["ticker"], e["date"]) for e in graph.memory_log.load_entries()}
 
-    for ticker in tickers:
-        for date in dates:
-            if (ticker, date) in done:
-                result.skipped += 1
-                continue
-            try:
-                graph.propagate(ticker, date, asset_type, portfolio=portfolio)
-                result.cells_run += 1
-            except Exception as exc:  # one unreachable vendor must not end the sweep
-                logger.warning("Backtest cell %s %s failed: %s", ticker, date, exc)
-                result.failures.append((ticker, date, str(exc)))
+    collector = fetch_issues.FetchIssueCollector()
+    fetch_issues.set_collector(collector)
+    try:
+        for ticker in tickers:
+            for date in dates:
+                if (ticker, date) in done:
+                    result.skipped += 1
+                    continue
+                try:
+                    with collector.cell(ticker, date):
+                        graph.propagate(ticker, date, asset_type, portfolio=portfolio)
+                    result.cells_run += 1
+                except Exception as exc:  # one unreachable vendor must not end the sweep
+                    logger.warning("Backtest cell %s %s failed: %s", ticker, date, exc)
+                    result.failures.append((ticker, date, str(exc)))
 
-    # Settlement runs at the start of the next run for a ticker, so each ticker's
-    # last cell would stay pending without this pass.
-    for ticker in tickers:
-        try:
-            graph.settle_pending(ticker)
-        except Exception as exc:  # reflection calls an LLM; one failure is not the sweep's
-            logger.warning("Settling %s failed: %s", ticker, exc)
-            result.settlement_failures.append((ticker, str(exc)))
+        # Settlement runs at the start of the next run for a ticker, so each ticker's
+        # last cell would stay pending without this pass.
+        for ticker in tickers:
+            try:
+                graph.settle_pending(ticker)
+            except Exception as exc:  # reflection calls an LLM; one failure is not the sweep's
+                logger.warning("Settling %s failed: %s", ticker, exc)
+                result.settlement_failures.append((ticker, str(exc)))
+    finally:
+        fetch_issues.set_collector(None)
+    result.fetch_issues = collector.issues
+
+    # One metric for the whole sweep: a table mixing alpha and raw rows would
+    # put two different questions in one column. One instrument whose benchmark
+    # says nothing about it takes the sweep with it.
+    if any(graph.scoring_metric(t, asset_type) == "raw" for t in tickers):
+        result.metric = "raw"
+
+    entries = graph.memory_log.load_entries()
+    result.curves = build_curves(entries, run_config)
+    try:
+        result.report_path = write_html_report(
+            result, summarize(graph.memory_log, result.metric), entries, run_config,
+        )
+    except Exception as exc:  # a report is a view of the sweep, never its point
+        logger.warning("Could not write the backtest report: %s", exc)
     return result
 
 
-def summarize(memory_log: TradingMemoryLog) -> BacktestSummary:
-    """Score the settled decisions in a log, by rating."""
+def summarize(memory_log: TradingMemoryLog, metric: str = "alpha") -> BacktestSummary:
+    """Score the settled decisions in a log, by rating.
+
+    ``metric`` selects the outcome scored: ``"alpha"`` against the instrument's
+    benchmark, or ``"raw"`` where that benchmark says nothing about it (see
+    ``TradingAgentsGraph.scoring_metric``).
+    """
     entries = memory_log.load_entries()
     # A decision with no readable rating has no direction, so it can neither
     # count for nor against the system; it is reported as unscored instead.
-    resolved = [(e, _alpha(e)) for e in entries
+    resolved = [(e, _outcome(e, metric)) for e in entries
                 if not e["pending"] and e["rating"] != RATING_REVIEW]
     resolved = [(e, a) for e, a in resolved if a is not None]
     by_rating: dict[str, RatingScore] = {}
     for rating in dict.fromkeys(e["rating"] for e, _ in resolved):
-        alphas = [a for e, a in resolved if e["rating"] == rating]
+        values = [a for e, a in resolved if e["rating"] == rating]
         direction = _DIRECTION.get(rating, 0)
         by_rating[rating] = RatingScore(
-            count=len(alphas),
-            hit_rate=(sum(a * direction > 0 for a in alphas) / len(alphas)) if direction else None,
-            mean_alpha=sum(alphas) / len(alphas),
+            count=len(values),
+            hit_rate=(sum(v * direction > 0 for v in values) / len(values)) if direction else None,
+            mean_value=sum(values) / len(values),
         )
     unscored = sum(1 for e in entries if e["rating"] == RATING_REVIEW)
     # Report the window the outcomes were actually measured over, from the log.
@@ -198,4 +288,5 @@ def summarize(memory_log: TradingMemoryLog) -> BacktestSummary:
     return BacktestSummary(resolved=len(resolved),
                            pending=len(entries) - len(resolved) - unscored,
                            by_rating=by_rating, unscored=unscored,
-                           holding=", ".join(sorted(windows)) or "the configured window")
+                           holding=", ".join(sorted(windows)) or "the configured window",
+                           metric=metric)

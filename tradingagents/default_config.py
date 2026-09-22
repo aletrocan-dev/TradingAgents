@@ -22,6 +22,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_TOKENS":           "max_tokens",
     "TRADINGAGENTS_CACHE_TOOL_FETCHES":   "cache_tool_fetches",
     "TRADINGAGENTS_CANONICAL_WINDOWS":    "canonical_tool_windows",
+    "TRADINGAGENTS_HOLDING_PERIOD_DAYS":  "holding_period_days",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
     # interactive choice, which is skipped when the matching var is set.
@@ -123,6 +124,16 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # rather than on who looked further back. Off by default: a single live run
     # is the product and decides its own windows; run_backtest() turns it on.
     "canonical_tool_windows": False,
+    # How the backtest report reads a rating as a position when it compares
+    # following the decisions against just holding the asset. Sell-side weights:
+    # a rating names the weight to hold, so Hold is neutral weight (in the
+    # market), not sitting it out. REVIEW always keeps the previous position.
+    "strategy_positions": {
+        "Buy": 1.0, "Overweight": 1.0, "Hold": 1.0, "Underweight": 0.0, "Sell": 0.0,
+    },
+    # Round-trip cost charged on turnover at each position change, in basis
+    # points. Zero makes beating buy & hold look easier than it is.
+    "strategy_cost_bps": 0.0,
     "news_lookback_days": 7,      # ticker-news window under canonical_tool_windows
     "price_lookback_days": 90,    # OHLCV window under canonical_tool_windows
     # Output language for analyst reports and final decision

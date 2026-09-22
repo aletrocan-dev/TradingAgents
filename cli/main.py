@@ -1369,6 +1369,11 @@ def analyze(
         "--clear-checkpoints",
         help="Delete all saved checkpoints before running (force fresh start).",
     ),
+    clear_fetch_cache: bool = typer.Option(
+        False,
+        "--clear-fetch-cache",
+        help="Delete all cached data-vendor fetches (see `backtest --no-cache-fetches`).",
+    ),
     portfolio: str = typer.Option(
         None,
         "--portfolio",
@@ -1383,6 +1388,10 @@ def analyze(
         from tradingagents.graph.checkpointer import clear_all_checkpoints
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
         console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
+    if clear_fetch_cache:
+        from tradingagents.dataflows.fetch_cache import clear_fetch_cache as _clear_fetch_cache
+        n = _clear_fetch_cache(DEFAULT_CONFIG["data_cache_dir"])
+        console.print(f"[yellow]Cleared {n} cached fetch(es).[/yellow]")
     portfolio_context = None
     if portfolio:
         from tradingagents.portfolio import load_portfolio
@@ -1423,6 +1432,18 @@ def backtest(
     run_id: str = typer.Option(
         None, "--run-id", help="Continue an earlier sweep: its cells are skipped and its log reused"
     ),
+    cache_fetches: bool = typer.Option(
+        True, "--cache-fetches/--no-cache-fetches",
+        help="Cache data-vendor fetches (news, OHLCV, fundamentals, ...) so a later sweep "
+        "over the same cells (even with a different model) reads identical input "
+        "instead of re-fetching live. On by default; see also --clear-fetch-cache.",
+    ),
+    canonical_windows: bool = typer.Option(
+        True, "--canonical-windows/--no-canonical-windows",
+        help="Pin every tool's window length to the configured one, so models are "
+        "compared on the same question rather than on who looked further back. "
+        "On by default, and only ever applied to a sweep, never to a single run.",
+    ),
 ):
     """Score past decisions over a grid of tickers and dates."""
     from tradingagents.agents.utils.memory import TradingMemoryLog
@@ -1439,7 +1460,10 @@ def backtest(
         console.print("[red]No ticker to analyze; pass them comma-separated, e.g. NVDA,AAPL[/red]")
         raise typer.Exit(code=1)
 
-    kwargs = {"asset_type": asset_type, "portfolio": book, "run_id": run_id}
+    kwargs = {
+        "asset_type": asset_type, "portfolio": book, "run_id": run_id,
+        "cache_fetches": cache_fetches, "canonical_windows": canonical_windows,
+    }
     if analysts:
         kwargs["selected_analysts"] = [a.strip().lower() for a in analysts.split(",") if a.strip()]
 
@@ -1448,12 +1472,27 @@ def backtest(
     except Exception as exc:  # a missing key or an unknown analyst is a setup error
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from None
-    console.print(summarize(TradingMemoryLog({"memory_log_path": str(result.log_path)})).render())
+    console.print(summarize(
+        TradingMemoryLog({"memory_log_path": str(result.log_path)}), result.metric
+    ).render())
     console.print(f"\nRan {result.cells_run} cells, skipped {result.skipped}. Log: {result.log_path}")
     for ticker, date, reason in result.failures:
         console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {reason}")
     for ticker, reason in result.settlement_failures:
         console.print(f"[yellow]unsettled:[/yellow] {ticker}: {reason}")
+    if result.fetch_issues:
+        by_method: dict[str, int] = {}
+        for issue in result.fetch_issues:
+            by_method[issue["method"]] = by_method.get(issue["method"], 0) + 1
+        summary_str = ", ".join(f"{m}={n}" for m, n in sorted(by_method.items()))
+        console.print(
+            f"[yellow]fetch issues:[/yellow] {len(result.fetch_issues)} "
+            f"({summary_str}) — see the HTML report for details"
+        )
+    for curve in result.curves:
+        console.print(curve.render())
+    if result.report_path:
+        console.print(f"HTML report: {result.report_path}")
 
 
 if __name__ == "__main__":

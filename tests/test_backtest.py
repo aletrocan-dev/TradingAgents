@@ -59,6 +59,9 @@ class _FakeGraph:
     def settle_pending(self, ticker):
         self.settled.append(ticker)
 
+    def scoring_metric(self, ticker, asset_type="stock"):
+        return "alpha"
+
 
 @pytest.fixture(autouse=True)
 def _fake_graph(monkeypatch, tmp_path):
@@ -135,7 +138,7 @@ def test_summary_scores_resolved_cells_and_keeps_pending_out_of_the_average(tmp_
 
     assert summary.resolved == 2 and summary.pending == 1
     buys = summary.by_rating["Buy"]
-    assert buys.count == 2 and buys.hit_rate == 0.5 and round(buys.mean_alpha, 4) == 0.01
+    assert buys.count == 2 and buys.hit_rate == 0.5 and round(buys.mean_value, 4) == 0.01
     assert "Sell" not in summary.by_rating  # unsettled: nothing to score yet
 
 
@@ -226,7 +229,7 @@ def test_a_bullish_call_is_scored_the_same_way_as_before(tmp_path):
 def test_hold_claims_no_direction_so_it_gets_no_hit_rate(tmp_path):
     scores = _scored(tmp_path, [("NVDA", "2026-01-05", "**Rating**: Hold\n\nx", (0.01, 0.005))])
     assert scores["Hold"].hit_rate is None
-    assert scores["Hold"].mean_alpha == 0.005
+    assert scores["Hold"].mean_value == 0.005
 
 
 @pytest.mark.unit
@@ -246,3 +249,45 @@ def test_the_window_reported_is_the_one_the_outcomes_used(tmp_path):
     log.update_with_outcome("NVDA", "2026-01-05", 0.1, 0.04, 21, "note", "2026-02-01")
 
     assert "21 trading days" in summarize(log).render()
+
+
+@pytest.mark.unit
+def test_a_sweep_pins_its_inputs_but_leaves_the_defaults_alone(tmp_path):
+    """A sweep is an experiment: same fetched data, same window per cell. A
+    single live run is the product and keeps both freedoms (defaults are off)."""
+    run_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path))
+    config = _FakeGraph.instances[-1].config
+    assert config["cache_tool_fetches"] is True
+    assert config["canonical_tool_windows"] is True
+
+
+@pytest.mark.unit
+def test_a_sweep_can_opt_out_of_both(tmp_path):
+    run_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path),
+                 cache_fetches=False, canonical_windows=False)
+    config = _FakeGraph.instances[-1].config
+    assert config["cache_tool_fetches"] is False
+    assert config["canonical_tool_windows"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dates, asset_type, expected", [
+    (["2026-01-05", "2026-01-06", "2026-01-07"], "crypto", 1),   # ogni giorno
+    (["2026-01-05", "2026-01-07", "2026-01-09"], "crypto", 2),   # a giorni alterni
+    (["2026-01-05", "2026-01-10", "2026-01-15"], "crypto", 5),
+    (["2026-01-05", "2026-01-12", "2026-01-19"], "stock", 5),    # 7 solari = 5 sedute
+    (["2026-01-05", "2026-01-06"], "stock", 1),                  # mai sotto una barra
+])
+def test_the_horizon_follows_the_grid(tmp_path, dates, asset_type, expected):
+    """A decision stands until the next one replaces it, so the gap between
+    cells is how long it actually held — judging it over any other window
+    scores a position the strategy never took."""
+    run_backtest(["NVDA"], dates, _config(tmp_path), asset_type=asset_type)
+    assert _FakeGraph.instances[-1].config["holding_period_days"] == expected
+
+
+@pytest.mark.unit
+def test_an_uneven_grid_keeps_the_configured_horizon(tmp_path):
+    config = {**_config(tmp_path), "holding_period_days": 9}
+    run_backtest(["NVDA"], ["2026-01-05", "2026-01-06", "2026-01-20"], config)
+    assert _FakeGraph.instances[-1].config["holding_period_days"] == 9

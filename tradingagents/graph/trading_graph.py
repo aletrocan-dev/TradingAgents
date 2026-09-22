@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -43,6 +44,23 @@ from .setup import GraphSetup
 from .signal_processing import SignalProcessor
 
 logger = logging.getLogger(__name__)
+
+
+def _print_message(msg) -> None:
+    """Print one streamed message, surviving a console that cannot encode it.
+
+    ``pretty_print`` writes straight to stdout, so on a stream that is not UTF-8
+    — a redirected console on Windows — a single character the model emitted
+    outside that codec raises and takes down a run that has already paid for its
+    inference. The trace is a debugging convenience; losing a line of it must
+    never cost the analysis.
+    """
+    try:
+        msg.pretty_print()
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        text = msg.pretty_repr() if hasattr(msg, "pretty_repr") else str(msg)
+        print(text.encode(encoding, "replace").decode(encoding, "replace"))
 
 
 def _validate_trade_date(trade_date) -> str:
@@ -288,6 +306,24 @@ class TradingAgentsGraph:
                 return benchmark
         return benchmark_map.get("", "SPY")
 
+    def scoring_metric(self, ticker: str, asset_type: str = "stock") -> str:
+        """``"alpha"`` when the benchmark stands for this instrument's market,
+        else ``"raw"``.
+
+        ``benchmark_map`` keys on a ticker's exchange suffix, which says where it
+        is listed rather than what it is exposed to. That holds for a single
+        stock and breaks elsewhere: a benchmark ETF resolves to itself, making
+        alpha identically zero so that every directional call scores as wrong,
+        and no equity index is the market a crypto asset trades against.
+        """
+        from tradingagents.dataflows.symbol_utils import normalize_symbol
+
+        if asset_type == "crypto":
+            return "raw"
+        if self._resolve_benchmark(ticker) == normalize_symbol(ticker):
+            return "raw"
+        return "alpha"
+
     def _fetch_returns(
         self, ticker: str, trade_date: str, holding_days: int = 5,
         benchmark: str = "SPY",
@@ -327,15 +363,25 @@ class TradingAgentsGraph:
                 (stock["Close"].iloc[holding_days] - stock["Close"].iloc[0])
                 / stock["Close"].iloc[0]
             )
-            bench_ret = float(
-                (bench["Close"].iloc[holding_days] - bench["Close"].iloc[0])
-                / bench["Close"].iloc[0]
-            )
-            alpha = raw - bench_ret
             # The date of the last price bar used is when this outcome became
             # known — the point-in-time cutoff for injecting the lesson (#1251).
-            resolution_date = stock.index[holding_days].strftime("%Y-%m-%d")
-            return raw, alpha, holding_days, resolution_date
+            resolution = stock.index[holding_days]
+
+            # Measure the benchmark to that same calendar point rather than to
+            # its own bar number: the two series need not share a trading
+            # calendar. Crypto prints a bar every day and an equity index five a
+            # week, so bar 5 of BTC is five calendar days out and bar 5 of SPY is
+            # seven — an alpha that subtracts a week of index drift from five
+            # days of asset return, on every crypto cell.
+            observed = bench[bench.index <= resolution]
+            if len(observed) < 2:
+                return None, None, None, None
+            bench_ret = float(
+                (observed["Close"].iloc[-1] - observed["Close"].iloc[0])
+                / observed["Close"].iloc[0]
+            )
+            alpha = raw - bench_ret
+            return raw, alpha, holding_days, resolution.strftime("%Y-%m-%d")
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s vs %s (will retry next run): %s",
@@ -600,7 +646,7 @@ class TradingAgentsGraph:
                     # when it changes (#1027); the trace/state merge is unchanged.
                     signature = (type(msg).__name__, getattr(msg, "content", None))
                     if signature != last_printed:
-                        msg.pretty_print()
+                        _print_message(msg)
                         last_printed = signature
                     trace.append(chunk)
             # Streamed chunks are per-node deltas. Merge them so the returned

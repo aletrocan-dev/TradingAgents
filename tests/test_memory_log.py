@@ -1040,3 +1040,39 @@ def test_a_longer_window_asks_for_enough_price_history(monkeypatch):
     raw, alpha, days, resolved = graph._fetch_returns("NVDA", "2026-06-01", 21, benchmark="SPY")
 
     assert days == 21 and resolved is not None, (raw, alpha, days, resolved)
+
+
+# --- the debug trace must not be able to end a run ---------------------------
+
+class _Unencodable:
+    """A message carrying a character the stream's codec has no mapping for."""
+
+    def pretty_print(self):
+        raise UnicodeEncodeError("charmap", "熊", 0, 1, "character maps to <undefined>")
+
+    def pretty_repr(self, html=False):
+        return "Bear case: 熊 market ahead"
+
+
+@pytest.mark.unit
+def test_a_message_the_console_cannot_encode_does_not_abort_the_run(capsys):
+    """A run in debug mode streams every message through pretty_print. One CJK
+    character from the model used to raise there and discard an analysis that
+    had already cost minutes of inference."""
+    from tradingagents.graph.trading_graph import _print_message
+
+    _print_message(_Unencodable())
+
+    assert "Bear case" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_a_printable_message_is_left_alone(capsys):
+    from tradingagents.graph.trading_graph import _print_message
+
+    class _Fine:
+        def pretty_print(self):
+            print("plain content")
+
+    _print_message(_Fine())
+    assert capsys.readouterr().out.strip() == "plain content"
