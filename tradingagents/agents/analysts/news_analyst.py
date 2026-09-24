@@ -8,6 +8,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_news,
     get_prediction_markets,
 )
+from tradingagents.agents.utils.structured import strip_reasoning
 from tradingagents.dataflows.interface import vendor_configured
 
 
@@ -68,7 +69,7 @@ def create_news_analyst(llm):
         report = ""
 
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = strip_reasoning(result.content)
 
         return {
             "messages": [result],

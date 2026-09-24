@@ -7,6 +7,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
     get_verified_market_snapshot,
 )
+from tradingagents.agents.utils.structured import strip_reasoning
 
 
 def create_market_analyst(llm):
@@ -84,7 +85,7 @@ Write a very detailed and nuanced report of the trends you observe. Provide spec
         report = ""
 
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = strip_reasoning(result.content)
 
         return {
             "messages": [result],

@@ -8,6 +8,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_instrument_context_from_state,
     get_language_instruction,
 )
+from tradingagents.agents.utils.structured import strip_reasoning
 
 
 def create_fundamentals_analyst(llm):
@@ -58,7 +59,7 @@ def create_fundamentals_analyst(llm):
         report = ""
 
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = strip_reasoning(result.content)
 
         return {
             "messages": [result],

@@ -5,6 +5,7 @@ from tradingagents.agents.utils.agent_utils import (
     opponent_argument_or_opening,
     report_or_absent,
 )
+from tradingagents.agents.utils.structured import strip_reasoning
 
 
 def create_conservative_debator(llm):
@@ -47,7 +48,7 @@ Engage by questioning their optimism and emphasizing the potential downsides the
 
         response = llm.invoke(prompt)
 
-        argument = f"Conservative Analyst: {response.content}"
+        argument = f"Conservative Analyst: {strip_reasoning(response.content)}"
 
         new_risk_debate_state = {
             "history": history + "\n" + argument,

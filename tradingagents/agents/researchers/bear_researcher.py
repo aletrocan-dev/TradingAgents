@@ -4,6 +4,7 @@ from tradingagents.agents.utils.agent_utils import (
     opponent_argument_or_opening,
     report_or_absent,
 )
+from tradingagents.agents.utils.structured import strip_reasoning
 
 
 def create_bear_researcher(llm):
@@ -52,7 +53,7 @@ Use this information to deliver a compelling bear argument, refute the bull's cl
 
         response = llm.invoke(prompt)
 
-        argument = f"Bear Analyst: {response.content}"
+        argument = f"Bear Analyst: {strip_reasoning(response.content)}"
 
         new_investment_debate_state = {
             "history": history + "\n" + argument,

@@ -5,6 +5,7 @@ from tradingagents.agents.utils.agent_utils import (
     opponent_argument_or_opening,
     report_or_absent,
 )
+from tradingagents.agents.utils.structured import strip_reasoning
 
 
 def create_neutral_debator(llm):
@@ -47,7 +48,7 @@ Engage actively by analyzing both sides critically, addressing weaknesses in the
 
         response = llm.invoke(prompt)
 
-        argument = f"Neutral Analyst: {response.content}"
+        argument = f"Neutral Analyst: {strip_reasoning(response.content)}"
 
         new_risk_debate_state = {
             "history": history + "\n" + argument,

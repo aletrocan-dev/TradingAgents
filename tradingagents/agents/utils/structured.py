@@ -19,6 +19,7 @@ all three agents log the same warnings when fallback fires.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -27,6 +28,26 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+
+# A block left unclosed is a response cut off mid-thought (by the token cap, say):
+# it holds no answer at all, so it goes too, rather than surviving as the text.
+_REASONING = re.compile(r"<think>.*?(?:</think>|\Z)", re.S | re.I)
+
+
+def strip_reasoning(text: Any) -> Any:
+    """The answer a reasoning model gave, without the deliberation behind it.
+
+    A model in the R1 family writes ``<think>...</think>`` before answering.
+    Handed to the next agent, that scratchpad reads as the agent's position —
+    including the hypotheses it weighed and rejected — and on a real sweep it
+    was a third of every debate history and half of the Research Manager's
+    plan, which is what pushed prompts past the context window. It also hands
+    the rating parser the tiers a model considered before settling on one.
+    Anything that is not a string passes through untouched.
+    """
+    if not isinstance(text, str):
+        return text
+    return _REASONING.sub("", text).strip()
 
 # Schema-only structured output binds exactly one tool (the schema itself), so a
 # model that reaches for a search tool emits an unknown tool call and the whole
@@ -78,7 +99,7 @@ def invoke_structured_or_freetext(
                 # the tool, leaving the parser with nothing to return. Treat it
                 # as a structured miss and fall back, with a clear reason.
                 raise ValueError("structured output returned no parsed result")
-            return render(result)
+            return strip_reasoning(render(result))
         except Exception as exc:
             logger.warning(
                 "%s: structured-output invocation failed (%s); retrying once as free text",
@@ -86,4 +107,4 @@ def invoke_structured_or_freetext(
             )
 
     response = plain_llm.invoke(prompt)
-    return response.content
+    return strip_reasoning(response.content)
