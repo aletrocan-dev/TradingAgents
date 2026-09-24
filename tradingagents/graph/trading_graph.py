@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import yfinance as yf
 from langgraph.prebuilt import ToolNode
 
@@ -355,6 +356,12 @@ class TradingAgentsGraph:
             # the analysis priced (e.g. XAUUSD -> GC=F) (#984). The benchmark is
             # already a canonical Yahoo symbol from ``_resolve_benchmark``.
             stock = yf.Ticker(normalize_symbol(ticker)).history(start=trade_date, end=end_str)
+            # Today's bar is still trading (crypto never closes, an equity may be
+            # mid-session): settling on it would score a price that is still
+            # moving, and a re-run would score the same cell differently. Each
+            # series is cut on its own exchange's calendar day.
+            if len(stock):
+                stock = stock[stock.index < pd.Timestamp.now(tz=stock.index.tz).normalize()]
 
             # Require the full holding window in the asset. A rerun before it
             # has traded leaves the entry pending to retry next run, rather than

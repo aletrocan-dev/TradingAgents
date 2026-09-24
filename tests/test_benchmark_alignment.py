@@ -101,6 +101,20 @@ def test_the_asset_settles_even_when_the_benchmark_cannot_be_priced(monkeypatch)
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("tz", [None, "UTC", "America/New_York"])
+def test_a_bar_still_trading_today_does_not_settle_a_cell(monkeypatch, tz):
+    """Settling on today's bar would score a price that is still moving."""
+    today = pd.Timestamp.now(tz=tz).normalize()
+    index = pd.DatetimeIndex([today - pd.Timedelta(days=1), today])
+    btc = pd.DataFrame({"Close": [100.0, 110.0]}, index=index)
+    _yahoo(monkeypatch, {"BTC-USD": btc, "SPY": _SPY})
+    trade_date = (today - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    assert TradingAgentsGraph._fetch_returns(
+        None, "BTC-USD", trade_date, holding_days=1, benchmark="SPY",
+    ) == (None, None, None, None)
+
+
+@pytest.mark.unit
 def test_a_missing_alpha_is_logged_as_not_available(tmp_path):
     assert _pct(None) == "n/a"
     assert _pct(0.1234) == "+12.3%"
