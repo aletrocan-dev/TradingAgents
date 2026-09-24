@@ -355,12 +355,12 @@ class TradingAgentsGraph:
             # the analysis priced (e.g. XAUUSD -> GC=F) (#984). The benchmark is
             # already a canonical Yahoo symbol from ``_resolve_benchmark``.
             stock = yf.Ticker(normalize_symbol(ticker)).history(start=trade_date, end=end_str)
-            bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
 
-            # Require the full holding window in both series. A rerun before it
+            # Require the full holding window in the asset. A rerun before it
             # has traded leaves the entry pending to retry next run, rather than
-            # settling on a premature partial return (#1169).
-            if len(stock) <= holding_days or len(bench) <= holding_days:
+            # settling on a premature partial return (#1169). The benchmark is
+            # not part of this test: it prices the alpha, not the outcome.
+            if len(stock) <= holding_days:
                 return None, None, None, None
 
             raw = float(
@@ -371,20 +371,10 @@ class TradingAgentsGraph:
             # known — the point-in-time cutoff for injecting the lesson (#1251).
             resolution = stock.index[holding_days]
 
-            # Measure the benchmark to that same calendar point rather than to
-            # its own bar number: the two series need not share a trading
-            # calendar. Crypto prints a bar every day and an equity index five a
-            # week, so bar 5 of BTC is five calendar days out and bar 5 of SPY is
-            # seven — an alpha that subtracts a week of index drift from five
-            # days of asset return, on every crypto cell.
-            observed = bench[bench.index <= resolution]
-            if len(observed) < 2:
-                return None, None, None, None
-            bench_ret = float(
-                (observed["Close"].iloc[-1] - observed["Close"].iloc[0])
-                / observed["Close"].iloc[0]
+            bench_ret = TradingAgentsGraph._benchmark_return(
+                benchmark, stock.index[0].date(), resolution.date(), start, end_str,
             )
-            alpha = raw - bench_ret
+            alpha = raw - bench_ret if bench_ret is not None else None
             return raw, alpha, holding_days, resolution.strftime("%Y-%m-%d")
         except Exception as e:
             logger.warning(
@@ -392,6 +382,41 @@ class TradingAgentsGraph:
                 ticker, trade_date, benchmark, e,
             )
             return None, None, None, None
+
+    @staticmethod
+    def _benchmark_return(benchmark, first_day, last_day, start, end_str) -> float | None:
+        """The benchmark's return over the calendar window the asset was held.
+
+        Each end is priced at the benchmark's last close on or before that day.
+        Two things this gets right that counting bars did not: the two series
+        need not share a calendar (crypto prints a bar a day, an equity index
+        five a week, so bar N of each is a different date), and a daily bar is
+        stamped at its own exchange's midnight — SPY's bar for a day sits hours
+        after BTC's for the same day, so comparing instants drops it. Held over
+        a weekend the index was shut, and its return is zero, not missing.
+
+        ``None`` only when the benchmark could not be priced at all; the asset's
+        own return is settled either way, since it does not depend on this.
+        """
+        try:
+            bench = yf.Ticker(benchmark).history(
+                start=(start - timedelta(days=7)).strftime("%Y-%m-%d"), end=end_str,
+            )
+            if bench.empty:
+                return None
+            days = bench.index.date
+
+            def close_on(day):
+                prior = bench["Close"][days <= day]
+                return float(prior.iloc[-1]) if len(prior) else None
+
+            base, last = close_on(first_day), close_on(last_day)
+            if not base or last is None:
+                return None
+            return (last - base) / base
+        except Exception as exc:
+            logger.warning("Could not price benchmark %s: %s", benchmark, exc)
+            return None
 
     def _resolve_pending_entries(self, ticker: str) -> None:
         """Resolve pending log entries for ticker at the start of a new run.

@@ -6,6 +6,16 @@ from pathlib import Path
 from tradingagents.agents.utils.rating import parse_rating
 
 
+def _pct(value: float | None) -> str:
+    """A return as the log writes it; ``n/a`` when there was nothing to measure.
+
+    Alpha needs a benchmark priced over the same window, which is not always
+    possible (the vendor was unreachable). The asset's own return settles the
+    entry regardless, so a missing alpha is recorded rather than blocking it.
+    """
+    return "n/a" if value is None else f"{value:+.1%}"
+
+
 class TradingMemoryLog:
     """Append-only markdown log of trading decisions and reflections."""
 
@@ -136,7 +146,7 @@ class TradingMemoryLog:
 
         pending_prefix = f"[{trade_date} | {ticker} |"
         raw_pct = f"{raw_return:+.1%}"
-        alpha_pct = f"{alpha_return:+.1%}"
+        alpha_pct = _pct(alpha_return)
 
         updated = False
         new_blocks = []
@@ -209,7 +219,7 @@ class TradingMemoryLog:
                     fields = [f.strip() for f in tag_line[1:-1].split("|")]
                     rating = fields[2]
                     raw_pct = f"{upd['raw_return']:+.1%}"
-                    alpha_pct = f"{upd['alpha_return']:+.1%}"
+                    alpha_pct = _pct(upd['alpha_return'])
                     new_tag = self._resolved_tag(
                         trade_date, ticker, rating, raw_pct, alpha_pct,
                         upd["holding_days"], upd.get("resolution_date"),

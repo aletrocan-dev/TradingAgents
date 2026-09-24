@@ -37,7 +37,7 @@ class Reflector:
         self,
         final_decision: str,
         raw_return: float,
-        alpha_return: float,
+        alpha_return: float | None,
         benchmark_name: str = "SPY",
         holding_days: int = 5,
     ) -> str:
@@ -49,13 +49,19 @@ class Reflector:
         for US tickers, ``"^N225"`` for ``.T`` listings); defaults to SPY for
         callers that haven't been updated to thread the benchmark through.
         """
+        # Alpha needs the benchmark priced over the same window; when it could not
+        # be, the lesson rests on the asset's own return rather than a made-up one.
+        alpha_line = (
+            f"Alpha vs {benchmark_name}: {alpha_return:+.1%}\n"
+            if alpha_return is not None else ""
+        )
         messages = [
             ("system", self._system_prompt(holding_days)),
             (
                 "human",
                 (
                     f"Raw return over {holding_days} trading days: {raw_return:+.1%}\n"
-                    f"Alpha vs {benchmark_name}: {alpha_return:+.1%}\n\n"
+                    f"{alpha_line}\n"
                     f"Final Decision:\n{final_decision}"
                 ),
             ),
