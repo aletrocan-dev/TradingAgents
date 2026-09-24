@@ -11,10 +11,12 @@ single-file-per-symbol cache (e.g. ``stockstats_utils``) does.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -55,8 +57,15 @@ def write_cache(method: str, args: tuple, kwargs: dict, config: dict, result: st
 
     A full disk, a path the OS rejects, or an argument that will not serialize
     would otherwise abort a sweep that had already got its data.
+
+    An agent can issue the same call twice in one parallel batch, and on Windows
+    replacing a file another thread holds open is refused. So the temporary name
+    is private to this writer, and an entry that already exists is left alone —
+    entries never change once written, so whoever stored it first stored this.
     """
     path = _entry_path(method, args, kwargs, config)
+    if path.exists():
+        return
     payload = {
         "method": method,
         "args": list(args),
@@ -64,13 +73,15 @@ def write_cache(method: str, args: tuple, kwargs: dict, config: dict, result: st
         "fetched_at": time.time(),
         "result": result,
     }
-    tmp = path.with_suffix(".tmp")
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
         os.replace(tmp, path)
     except OSError as exc:
         logger.warning("Could not cache %s: %s", method, exc)
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
 
 
 def clear_fetch_cache(data_cache_dir: str | Path) -> int:

@@ -1,5 +1,7 @@
+import contextlib
 import logging
 import os
+import threading
 import time
 from typing import Annotated
 
@@ -14,6 +16,25 @@ from .symbol_utils import NoMarketDataError, normalize_symbol
 from .utils import safe_ticker_component, vendor_reachable
 
 logger = logging.getLogger(__name__)
+
+
+def _write_csv_atomically(frame: pd.DataFrame, path: str) -> None:
+    """Replace ``path`` with ``frame`` so no reader can see it half-written.
+
+    The price file is rewritten every day, and an agent's indicator calls run
+    in parallel: a reader that caught the file mid-write got an empty frame
+    ("No columns to parse from file") and fell back to computing each day on
+    its own. The data is already in hand, so failing to store it only costs a
+    re-download next time.
+    """
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        frame.to_csv(tmp, index=False, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("Could not cache prices at %s: %s", path, exc)
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
 
 _YAHOO_HOST = "https://query2.finance.yahoo.com"
 
@@ -254,7 +275,7 @@ def load_ohlcv(symbol: str, curr_date: str, fill_gaps: bool = True) -> pd.DataFr
         # Only cache real data — never persist an empty frame.
         if downloaded.empty or "Close" not in downloaded.columns:
             raise_for_empty(symbol, canonical, "price rows")
-        downloaded.to_csv(data_file, index=False, encoding="utf-8")
+        _write_csv_atomically(downloaded, data_file)
         data = downloaded
 
     data = _clean_dataframe(data)
