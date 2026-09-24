@@ -441,20 +441,24 @@ class TradingAgentsGraph:
             )
             if raw is None:
                 continue  # price not available yet — try again next run
-            try:
-                reflection = self.reflector.reflect_on_final_decision(
-                    final_decision=entry.get("decision", ""),
-                    raw_return=raw,
-                    alpha_return=alpha,
-                    benchmark_name=benchmark,
-                    holding_days=days,
-                )
-            except Exception as exc:
-                # Reflection calls a provider, and this runs on the way into a
-                # new run: a transient failure leaves the entry pending for the
-                # next one rather than stopping the analysis that was asked for.
-                logger.warning("Reflection failed for %s on %s: %s", ticker, entry["date"], exc)
-                continue
+            reflection = ""
+            # Nothing reads a reflection that is never injected, and each one is a
+            # model call: a sweep settles its outcomes without them.
+            if self.config.get("learn_from_past_decisions", True):
+                try:
+                    reflection = self.reflector.reflect_on_final_decision(
+                        final_decision=entry.get("decision", ""),
+                        raw_return=raw,
+                        alpha_return=alpha,
+                        benchmark_name=benchmark,
+                        holding_days=days,
+                    )
+                except Exception as exc:
+                    # Reflection calls a provider, and this runs on the way into a
+                    # new run: a transient failure leaves the entry pending for the
+                    # next one rather than stopping the analysis that was asked for.
+                    logger.warning("Reflection failed for %s on %s: %s", ticker, entry["date"], exc)
+                    continue
             updates.append({
                 "ticker": ticker,
                 "trade_date": entry["date"],
@@ -624,8 +628,9 @@ class TradingAgentsGraph:
             company_name,
             trade_date,
             asset_type=asset_type,
-            past_context=self.memory_log.get_past_context(
-                company_name, as_of=self._memory_as_of(trade_date)
+            past_context=(
+                self.memory_log.get_past_context(company_name, as_of=self._memory_as_of(trade_date))
+                if self.config.get("learn_from_past_decisions", True) else ""
             ),
             instrument_context=self.resolve_instrument_context(company_name, asset_type, trade_date),
             portfolio_context=portfolio.render(company_name) if portfolio is not None else "",

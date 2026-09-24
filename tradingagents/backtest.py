@@ -205,7 +205,10 @@ def run_backtest(
     run_config = {**config, "results_dir": str(run_dir),
                   "memory_log_path": str(run_dir / "trading_memory.md"),
                   "cache_tool_fetches": cache_fetches,
-                  "canonical_tool_windows": canonical_windows}
+                  "canonical_tool_windows": canonical_windows,
+                  # Every cell decides from the same inputs: no lessons from the
+                  # sweep's own earlier decisions, which differ model by model.
+                  "learn_from_past_decisions": False}
     holding = _grid_holding_days(dates, asset_type)
     if holding is not None:
         run_config["holding_period_days"] = holding

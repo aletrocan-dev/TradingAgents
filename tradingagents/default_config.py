@@ -124,6 +124,14 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # rather than on who looked further back. Off by default: a single live run
     # is the product and decides its own windows; run_backtest() turns it on.
     "canonical_tool_windows": False,
+    # When True, a run settles this ticker's earlier decisions, reflects on each
+    # outcome and injects those lessons into the Portfolio Manager. On for live
+    # runs: learning from its own record is part of the system. run_backtest()
+    # turns it off, because each model would learn from its own decisions and the
+    # inputs of two sweeps would drift apart cell by cell — and with no lessons to
+    # inject, every reflection is a model call spent for nothing. Outcomes are
+    # still settled either way, since the scores need them.
+    "learn_from_past_decisions": True,
     # How the backtest report reads a rating as a position when it compares
     # following the decisions against just holding the asset. Sell-side weights:
     # a rating names the weight to hold, so Hold is neutral weight (in the
