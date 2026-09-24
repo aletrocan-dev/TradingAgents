@@ -423,3 +423,75 @@ def test_an_unreachable_ollama_does_not_stop_the_sweep(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
     assert _ollama_models({"backend_url": "http://localhost:11434/v1", "deep_think_llm": "x"}) is None
+
+
+@pytest.fixture
+def _curves(monkeypatch):
+    """The progress curve without the network: record what it was asked for."""
+    import tradingagents.backtest as bt
+
+    asked = []
+    monkeypatch.setattr(bt, "build_curve", lambda entries, ticker, config, until=None:
+                        asked.append((ticker, until, len(entries))) or f"curve {ticker} {until}")
+    return asked
+
+
+@pytest.mark.unit
+def test_every_cell_run_is_reported_as_it_finishes(tmp_path, _curves):
+    seen = []
+    run_backtest(["NVDA", "AAPL"], ["2026-01-05", "2026-01-06"], _config(tmp_path), on_cell=seen.append)
+    assert [(p.ticker, p.date, p.done, p.total) for p in seen] == [
+        ("NVDA", "2026-01-05", 1, 4), ("NVDA", "2026-01-06", 2, 4),
+        ("AAPL", "2026-01-05", 3, 4), ("AAPL", "2026-01-06", 4, 4),
+    ]
+    assert all(p.rating == "Buy" and p.error is None for p in seen)
+    assert seen[1].curve == "curve NVDA 2026-01-06"  # read up to the cell just run
+    assert _curves[1] == ("NVDA", "2026-01-06", 2)   # with the decisions logged so far
+    assert seen[-1].elapsed >= seen[0].elapsed >= 0
+
+
+@pytest.mark.unit
+def test_a_resumed_sweep_counts_only_what_is_left(tmp_path, _curves):
+    run_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path), run_id="r")
+    seen = []
+    run_backtest(["NVDA"], ["2026-01-05", "2026-01-06"], _config(tmp_path), run_id="r", on_cell=seen.append)
+    assert [(p.date, p.done, p.total) for p in seen] == [("2026-01-06", 1, 1)]
+
+
+@pytest.mark.unit
+def test_a_failed_cell_is_reported_with_its_error(tmp_path, _curves):
+    _FakeGraph.fail_on = {("NVDA", "2026-01-06")}
+    seen = []
+    run_backtest(["NVDA"], ["2026-01-05", "2026-01-06"], _config(tmp_path), on_cell=seen.append)
+    assert seen[1].error == "vendor exploded" and seen[1].rating is None
+    assert seen[1].done == 2
+
+
+@pytest.mark.unit
+def test_the_time_left_is_estimated_from_the_cells_so_far():
+    from tradingagents.backtest import CellProgress
+
+    halfway = CellProgress("NVDA", "2026-01-05", done=2, total=6, seconds=50, elapsed=100)
+    assert halfway.remaining_seconds == 200
+
+
+@pytest.mark.unit
+def test_a_broken_display_does_not_cost_the_sweep(tmp_path, _curves):
+    def explode(progress):
+        raise RuntimeError("terminal gone")
+
+    result = run_backtest(["NVDA"], ["2026-01-05", "2026-01-06"], _config(tmp_path), on_cell=explode)
+    assert result.cells_run == 2 and result.failures == []
+
+
+@pytest.mark.unit
+def test_unreachable_prices_leave_the_cell_reported_without_a_curve(tmp_path, monkeypatch):
+    import tradingagents.backtest as bt
+
+    def offline(*args, **kwargs):
+        raise ConnectionError("no route")
+
+    monkeypatch.setattr(bt, "build_curve", offline)
+    seen = []
+    run_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path), on_cell=seen.append)
+    assert len(seen) == 1 and seen[0].curve is None

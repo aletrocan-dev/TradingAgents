@@ -80,7 +80,7 @@ Local reasoning models (Ollama) need `max_tokens` set (`TRADINGAGENTS_MAX_TOKENS
 
 ### CLI (`cli/`)
 
-`cli/main.py` is the Typer app (`tradingagents` entry point). `cli/config.py` and `cli/prefs.py` handle interactive prompts and persisting the previous run's answers as defaults; `TRADINGAGENTS_*` env vars skip their corresponding prompt entirely. `cli/models.py` surfaces the curated per-provider model catalog to the picker. The CLI auto-detects `asset_type` (stock vs crypto) from the ticker and accepts a portfolio via `--portfolio <file.json>` (same schema as `tradingagents.portfolio.PortfolioContext`).
+`cli/main.py` is the Typer app (`tradingagents` entry point). `cli/config.py` and `cli/prefs.py` handle interactive prompts and persisting the previous run's answers as defaults; `TRADINGAGENTS_*` env vars skip their corresponding prompt entirely. `cli/models.py` surfaces the curated per-provider model catalog to the picker. A sweep is otherwise silent while the graph runs, so `backtest` passes `run_backtest(on_cell=...)` a callback that prints, after every cell, progress with a time-left estimate (`CellProgress`) and the ticker's strategy-vs-buy&hold curve read up to that cell (`build_curve(..., until=date)`), drawn by `cli/curve_chart.py` — heavy stroke for the strategy, light for buy & hold, so it reads without colour — and the final chart again at the end. The CLI auto-detects `asset_type` (stock vs crypto) from the ticker and accepts a portfolio via `--portfolio <file.json>` (same schema as `tradingagents.portfolio.PortfolioContext`).
 
 ## Conventions
 

@@ -22,6 +22,8 @@ import logging
 import os
 import re
 import subprocess
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -32,7 +34,7 @@ from tradingagents.backtest_report import write_html_report
 from tradingagents.dataflows import fetch_issues
 from tradingagents.dataflows.utils import get_current_date, safe_ticker_component
 from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.strategy_curve import StrategyCurve, build_curves
+from tradingagents.strategy_curve import StrategyCurve, build_curve, build_curves
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,45 @@ class BacktestResult:
     # differ from the manifest the run was started under, when it was resumed.
     manifest: dict = field(default_factory=dict)
     manifest_mismatch: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CellProgress:
+    """A cell of a running sweep has finished: what a live display shows of it.
+
+    A sweep is silent while the graph runs, and one can take a day, so the
+    caller of run_backtest() gets one of these per cell it runs. ``done`` and
+    ``total`` count only the cells this invocation runs: cells already in a
+    resumed log are neither.
+    """
+
+    ticker: str
+    date: str
+    done: int
+    total: int
+    seconds: float          # this cell's wall time
+    elapsed: float          # since this invocation started
+    rating: str | None = None
+    error: str | None = None
+    # This ticker's decisions so far, read up to this cell's close.
+    curve: StrategyCurve | None = None
+
+    @property
+    def remaining_seconds(self) -> float:
+        return self.elapsed / self.done * (self.total - self.done) if self.done else 0.0
+
+
+def _report_cell(on_cell: Callable[[CellProgress], None], graph, config: dict,
+                 progress: CellProgress) -> None:
+    try:
+        progress.curve = build_curve(graph.memory_log.load_entries(), progress.ticker,
+                                     config, until=progress.date)
+    except Exception as exc:  # prices can be briefly unreachable; the cell still counts
+        logger.debug("No curve for %s up to %s: %s", progress.ticker, progress.date, exc)
+    try:
+        on_cell(progress)
+    except Exception as exc:  # a display must never cost a sweep that is hours in
+        logger.warning("Progress display failed: %s", exc)
 
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -392,6 +433,7 @@ def run_backtest(
     run_id: str | None = None,
     cache_fetches: bool = True,
     canonical_windows: bool = True,
+    on_cell: Callable[[CellProgress], None] | None = None,
 ) -> BacktestResult:
     """Analyze every ticker on every date, into a decision log of this run's own.
 
@@ -416,6 +458,11 @@ def run_backtest(
     so the gap between them is how long that decision actually stood. Judging a
     sweep stepping two days over a five-day window would score a position the
     strategy never held. The configured value still governs live runs.
+
+    ``on_cell``, when given, is called after every cell this invocation runs,
+    failed ones included, with a CellProgress carrying the ticker's strategy
+    curve up to that date. It is a display hook: whatever it raises is logged
+    and the sweep goes on.
     """
     # run_id becomes a path segment, so it is validated like a ticker: an
     # absolute or dotted value would otherwise place the run outside results_dir.
@@ -439,6 +486,8 @@ def run_backtest(
     result.manifest = _run_manifest(run_config, tickers, dates, asset_type, selected_analysts)
     result.manifest_mismatch = _record_manifest(run_dir, result.manifest, len(done))
 
+    total = sum((t, d) not in done for t in tickers for d in dates)
+    started = time.monotonic()
     collector = fetch_issues.FetchIssueCollector()
     fetch_issues.set_collector(collector)
     try:
@@ -447,13 +496,24 @@ def run_backtest(
                 if (ticker, date) in done:
                     result.skipped += 1
                     continue
+                cell_started = time.monotonic()
+                rating = error = None
                 try:
                     with collector.cell(ticker, date):
-                        graph.propagate(ticker, date, asset_type, portfolio=portfolio)
+                        _, rating = graph.propagate(ticker, date, asset_type, portfolio=portfolio)
                     result.cells_run += 1
                 except Exception as exc:  # one unreachable vendor must not end the sweep
                     logger.warning("Backtest cell %s %s failed: %s", ticker, date, exc)
                     result.failures.append((ticker, date, str(exc)))
+                    error = str(exc)
+                if on_cell is not None:
+                    now = time.monotonic()
+                    _report_cell(on_cell, graph, run_config, CellProgress(
+                        ticker=ticker, date=date,
+                        done=result.cells_run + len(result.failures), total=total,
+                        seconds=now - cell_started, elapsed=now - started,
+                        rating=rating, error=error,
+                    ))
 
         # Settlement runs at the start of the next run for a ticker, so each ticker's
         # last cell would stay pending without this pass.

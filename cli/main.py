@@ -1,3 +1,4 @@
+import contextlib
 import datetime
 import os
 import sys
@@ -1459,14 +1460,23 @@ def backtest(
     if not names:
         console.print("[red]No ticker to analyze; pass them comma-separated, e.g. NVDA,AAPL[/red]")
         raise typer.Exit(code=1)
+    if not dates:
+        console.print(f"[red]No analysis date: {start} is after today.[/red]")
+        raise typer.Exit(code=1)
 
     kwargs = {
         "asset_type": asset_type, "portfolio": book, "run_id": run_id,
         "cache_fetches": cache_fetches, "canonical_windows": canonical_windows,
+        "on_cell": _print_cell_progress,
     }
     if analysts:
         kwargs["selected_analysts"] = [a.strip().lower() for a in analysts.split(",") if a.strip()]
 
+    console.print(
+        f"Sweep of {len(names) * len(dates)} cells ({', '.join(names)}, {dates[0]} to "
+        f"{dates[-1]}, every {every} days). Cells already in the log are skipped; "
+        "progress and the strategy curve print after each cell."
+    )
     try:
         result = run_backtest(names, dates, DEFAULT_CONFIG, **kwargs)
     except Exception as exc:  # a missing key or an unknown analyst is a setup error
@@ -1497,8 +1507,41 @@ def backtest(
         )
     for curve in result.curves:
         console.print(curve.render())
+        console.print()
+        _print_curve_chart(curve)
     if result.report_path:
         console.print(f"HTML report: {result.report_path}")
+
+
+def _duration(seconds: float) -> str:
+    minutes, secs = divmod(round(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m {secs:02d}s" if minutes else f"{secs}s"
+
+
+def _print_curve_chart(curve) -> None:
+    from cli.curve_chart import render_curve_chart
+
+    # A console that cannot draw box characters still has the one-line summary.
+    with contextlib.suppress(UnicodeEncodeError):
+        console.print(render_curve_chart(curve, width=min(console.width, 110)))
+
+
+def _print_cell_progress(progress) -> None:
+    """One sweep cell has finished: where the sweep is, and how it is doing."""
+    line = Text(f"\n[{progress.done}/{progress.total}] {progress.ticker} {progress.date}  ", style="bold")
+    if progress.error:
+        line.append(f"failed: {progress.error}", style="red")
+    else:
+        line.append(progress.rating or "?", style="yellow" if is_review(progress.rating or "") else "cyan")
+    line.append(f"  {_duration(progress.seconds)}  ·  elapsed {_duration(progress.elapsed)}")
+    if progress.done < progress.total:
+        line.append(f"  ·  ~{_duration(progress.remaining_seconds)} left")
+    console.print(line)
+    if progress.curve is not None:
+        _print_curve_chart(progress.curve)
 
 
 if __name__ == "__main__":

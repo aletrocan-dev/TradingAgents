@@ -44,6 +44,9 @@ class StrategyCurve:
     # (bar index, rating) for every decision, so a reader can see where the
     # system acted and what it called rather than inferring it from the line.
     markers: list[tuple[int, str]] = field(default_factory=list)
+    # What the last decision left the strategy holding. ``positions`` stops at
+    # the last bar's return, so it cannot say whether that decision got out.
+    final_position: float = 0.0
     cost_bps: float = 0.0
     rule: dict[str, float] = field(default_factory=dict)
 
@@ -83,15 +86,20 @@ def _target_positions(config: dict) -> dict[str, float]:
     return {**DEFAULT_POSITIONS, **(config.get("strategy_positions") or {})}
 
 
-def build_curve(entries: list[dict], ticker: str, config: dict) -> StrategyCurve | None:
+def build_curve(entries: list[dict], ticker: str, config: dict,
+                until: str | None = None) -> StrategyCurve | None:
     """Follow ``ticker``'s decisions bar by bar; ``None`` when it has none.
 
     A decision dated D is acted on at D's close: the analysis saw data through D,
     so that is the first fill it could have got. A decision with no readable
     rating keeps the position — it is not an order.
+
+    ``until`` ends the curve at that date's close rather than at the latest bar,
+    so a sweep still running can be read up to the cell it has reached.
     """
+    last = until or get_current_date()
     signals = sorted(
-        (e for e in entries if e["ticker"] == ticker and e.get("date")),
+        (e for e in entries if e["ticker"] == ticker and e.get("date") and e["date"] <= last),
         key=lambda e: e["date"],
     )
     if not signals:
@@ -100,8 +108,9 @@ def build_curve(entries: list[dict], ticker: str, config: dict) -> StrategyCurve
     rule = _target_positions(config)
     cost_bps = float(config.get("strategy_cost_bps") or 0.0)
 
-    prices = load_ohlcv(ticker, get_current_date(), fill_gaps=False)
-    rows = prices[prices["Date"] >= signals[0]["date"]].reset_index(drop=True)
+    prices = load_ohlcv(ticker, last, fill_gaps=False)
+    rows = prices[(prices["Date"] >= signals[0]["date"])
+                  & (prices["Date"] <= last)].reset_index(drop=True)
     if len(rows) < 2:
         return None
 
@@ -145,6 +154,7 @@ def build_curve(entries: list[dict], ticker: str, config: dict) -> StrategyCurve
         curve.positions.append(position)
         act(i)
 
+    curve.final_position = position
     return curve
 
 

@@ -157,3 +157,38 @@ def test_backtest_reports_a_setup_failure_in_one_line(runner, monkeypatch):
     assert result.exit_code == 1
     assert "API key" in result.output
     assert "Traceback" not in result.output
+
+
+@pytest.mark.unit
+def test_the_backtest_prints_each_cell_as_it_finishes(runner, monkeypatch, tmp_path):
+    from tradingagents.backtest import CellProgress
+    from tradingagents.strategy_curve import StrategyCurve
+
+    curve = StrategyCurve(ticker="NVDA", dates=["2026-06-01", "2026-06-02"], strategy=[1.0, 1.1],
+                          buy_hold=[1.0, 1.05], positions=[1.0], markers=[(0, "Buy")],
+                          final_position=1.0)
+
+    def sweep(*args, on_cell=None, **kwargs):
+        on_cell(CellProgress("NVDA", "2026-06-02", done=1, total=3, seconds=65, elapsed=65,
+                             rating="Buy", curve=curve))
+        on_cell(CellProgress("NVDA", "2026-06-03", done=2, total=3, seconds=5, elapsed=70,
+                             error="vendor exploded"))
+        return _Result(tmp_path)
+
+    monkeypatch.setattr(m, "run_backtest", sweep)
+    monkeypatch.setattr(m, "summarize", lambda log, metric="alpha": _Summary())
+    result = runner.invoke(m.app, ["backtest", "NVDA", "--start", "2026-06-01",
+                                   "--end", "2026-06-03", "--every", "1"])
+
+    assert result.exit_code == 0, result.output
+    assert "[1/3] NVDA 2026-06-02  Buy  1m 05s" in result.output
+    assert "~2m 10s left" in result.output
+    assert "strategy +10.0%" in result.output          # the chart, after the cell
+    assert "[2/3] NVDA 2026-06-03  failed: vendor exploded" in result.output
+
+
+@pytest.mark.unit
+def test_a_start_after_today_is_refused_before_anything_runs(runner):
+    result = runner.invoke(m.app, ["backtest", "NVDA", "--start", "2999-01-01", "--end", "2999-01-02"])
+    assert result.exit_code == 1
+    assert "after today" in result.output
