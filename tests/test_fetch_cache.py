@@ -259,6 +259,32 @@ def test_the_verified_market_snapshot_is_cached_too(tmp_path):
 
 
 @pytest.mark.unit
+def test_a_mistyped_symbol_is_a_snapshot_result_not_a_failed_run(tmp_path):
+    """A model asked for BTC-USD.TC. Raised, the error went through the ToolNode
+    and ended the whole cell; returned, the model can correct the ticker."""
+    import tradingagents.agents.utils.market_data_validation_tools as tools
+    from tradingagents.dataflows import fetch_issues
+    from tradingagents.dataflows.errors import NoMarketDataError
+
+    set_config({"data_cache_dir": str(tmp_path), "cache_tool_fetches": True})
+    builder = mock.Mock(side_effect=NoMarketDataError("BTC-USD.TC", "BTC-USD.TC", "no price rows"))
+    collector = fetch_issues.FetchIssueCollector()
+    fetch_issues.set_collector(collector)
+    try:
+        with mock.patch.object(tools, "build_verified_market_snapshot", builder):
+            first = tools.get_verified_market_snapshot.func("BTC-USD.TC", "2026-06-23", 30, "2026-06-23")
+            tools.get_verified_market_snapshot.func("BTC-USD.TC", "2026-06-23", 30, "2026-06-23")
+    finally:
+        fetch_issues.set_collector(None)
+
+    assert first.startswith("NO_DATA_AVAILABLE:") and "BTC-USD.TC" in first
+    assert builder.call_count == 2  # a no-data verdict is never served from the cache
+    assert [(i["method"], i["reason"]) for i in collector.issues][:1] == [
+        ("get_verified_market_snapshot", "no_data"),
+    ]
+
+
+@pytest.mark.unit
 def test_route_to_vendor_cache_is_keyed_on_the_call_not_the_caller(tmp_path):
     """Two different config setups (standing in for two different models/runs)
     hitting the same cache dir with the same call must see the same input."""

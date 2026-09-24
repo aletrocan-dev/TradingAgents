@@ -230,6 +230,30 @@ def route_to_vendor(method: str, *args, **kwargs):
     )
 
 
+def no_data_result(method: str, error: NoMarketDataError, args: tuple) -> str:
+    """The tool result for a symbol no source has data for, recorded as an issue.
+
+    Returned to the model rather than raised: a symbol the model got wrong is
+    something it can correct on its next call, while an exception out of a tool
+    ends the whole run (LangGraph's ToolNode re-raises anything that is not a
+    malformed call).
+    """
+    sym = error.symbol
+    canonical = error.canonical
+    resolved = "" if canonical == sym else f" (resolved to '{canonical}')"
+    # Surface the typed error's detail (e.g. "latest row is 2025-06-11 ...
+    # stale") so the agent sees the specific reason — invalid symbol, no
+    # coverage, or stale data — not just a generic "unavailable".
+    reason = f" ({error.detail})" if error.detail else ""
+    fetch_issues.record(method, "no_data", f"{sym}{resolved}{reason}", args)
+    return (
+        f"NO_DATA_AVAILABLE: No usable market data for '{sym}'{resolved} from "
+        f"any configured vendor{reason}. The symbol may be invalid, delisted, "
+        f"not covered, or the vendor returned stale data. Do not estimate or "
+        f"fabricate values — report that data is unavailable for this symbol."
+    )
+
+
 def _route_to_vendor_uncached(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
@@ -301,20 +325,7 @@ def _route_to_vendor_uncached(method: str, *args, **kwargs):
                 "Returning NO_DATA for %s, but a vendor errored earlier: %s",
                 method, first_error,
             )
-        sym = last_no_data.symbol
-        canonical = last_no_data.canonical
-        resolved = "" if canonical == sym else f" (resolved to '{canonical}')"
-        # Surface the typed error's detail (e.g. "latest row is 2025-06-11 ...
-        # stale") so the agent sees the specific reason — invalid symbol, no
-        # coverage, or stale data — not just a generic "unavailable".
-        reason = f" ({last_no_data.detail})" if last_no_data.detail else ""
-        fetch_issues.record(method, "no_data", f"{sym}{resolved}{reason}", args)
-        return (
-            f"NO_DATA_AVAILABLE: No usable market data for '{sym}'{resolved} from "
-            f"any configured vendor{reason}. The symbol may be invalid, delisted, "
-            f"not covered, or the vendor returned stale data. Do not estimate or "
-            f"fabricate values — report that data is unavailable for this symbol."
-        )
+        return no_data_result(method, last_no_data, args)
 
     # No vendor returned data and none reported clean "no data" — surface the
     # first real error (e.g. the primary vendor's network failure). Optional
