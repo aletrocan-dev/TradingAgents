@@ -465,6 +465,104 @@ def _failures_table(title: str, rows: list, columns: list[str]) -> str:
     )
 
 
+_MISMATCH_LABELS = {
+    "unrecorded": "celle eseguite prima che esistesse un manifesto",
+    "code": "codice",
+    "model": "modello o parametri di generazione",
+    "server": "server Ollama (pesi, contesto o KV cache)",
+    "pipeline": "pipeline (analisti, round, orizzonte, vendor)",
+    "sweep": "impostazioni dello sweep (cache, finestre, lezioni)",
+}
+
+
+def _mismatch_banner(mismatch: list[str]) -> str:
+    if not mismatch:
+        return ""
+    what = "; ".join(_MISMATCH_LABELS.get(k, k) for k in mismatch)
+    return (
+        "<div class='panel warn-panel'><h3>Celle prodotte in condizioni diverse</h3>"
+        f"<p>Questo sweep &egrave; stato ripreso con: {escape(what)}. Le celle non sono tutte "
+        "confrontabili tra loro: per confrontare configurazioni o modelli usa un nuovo "
+        "<code>--run-id</code>.</p></div>"
+    )
+
+
+def _yes_no(value) -> str:
+    return "s&igrave;" if value else "no"
+
+
+def _manifest_section(manifest: dict) -> str:
+    """The conditions a sweep ran under, so two reports can be checked for comparability."""
+    if not manifest:
+        return "<p class='empty'>Nessun manifesto registrato per questo run.</p>"
+    code = manifest.get("code") or {}
+    model = manifest.get("model") or {}
+    server = manifest.get("server") or {}
+    grid = manifest.get("grid") or {}
+    pipeline = manifest.get("pipeline") or {}
+    sweep = manifest.get("sweep") or {}
+    strategy = manifest.get("strategy") or {}
+
+    commit = manifest.get("commit")
+    code_cell = f"<code>{escape(commit[:10])}</code>" if commit else "sconosciuto (non &egrave; un checkout git)"
+    if code.get("uncommitted"):
+        code_cell += (" <span class='warn'>+ modifiche non committate "
+                      f"(impronta <code>{escape(code['uncommitted'])}</code>)</span>")
+
+    deep, quick = model.get("deep_think_llm"), model.get("quick_think_llm")
+    names = (f"{escape(str(deep))} (deep e quick)" if deep == quick
+             else f"{escape(str(deep))} (deep), {escape(str(quick))} (quick)")
+    temperature = model.get("temperature")
+    max_tokens = model.get("max_tokens")
+    rows = [
+        ("Codice", code_cell),
+        ("Modello", f"{escape(str(model.get('provider')))} &middot; {names}"),
+        ("Generazione",
+         f"temperatura {escape(str(temperature)) if temperature is not None else 'default del provider'}"
+         f" &middot; max token in uscita {escape(str(max_tokens)) if max_tokens else 'nessun limite'}"),
+    ]
+    for name, info in (server.get("models") or {}).items():
+        rows.append((f"Pesi {escape(name)}", " &middot; ".join(escape(str(v)) for v in (
+            f"digest {info.get('digest')}", info.get("parameters"), info.get("quantization"),
+            f"contesto {info.get('num_ctx')} token",
+        ))))
+    if server:
+        source = "dal log del server" if server.get("read_from") == "server log" else "dall'ambiente del client"
+        rows.append(("Server Ollama",
+                     f"KV cache {escape(str(server.get('kv_cache_type')))} &middot; flash attention "
+                     f"{escape(str(server.get('flash_attention')))} <span class='times'>({source})</span>"))
+    every = grid.get("every_days")
+    step = ("ogni giorno" if every == 1 else f"ogni {every} giorni" if every else "passo irregolare")
+    holding = pipeline.get("holding_period_days")
+    rows += [
+        ("Griglia",
+         f"{escape(str(grid.get('first')))} &rarr; {escape(str(grid.get('last')))} &middot; "
+         f"{grid.get('cells')} celle &middot; {step} &middot; {escape(str(grid.get('asset_type')))}"),
+        ("Pipeline",
+         f"analisti {escape(', '.join(pipeline.get('analysts') or []))} &middot; "
+         f"debate {pipeline.get('max_debate_rounds')} round &middot; rischio "
+         f"{pipeline.get('max_risk_discuss_rounds')} round &middot; orizzonte "
+         f"{holding} {'giorno' if holding == 1 else 'giorni'} di trading"),
+        ("Vendor dati", escape(", ".join(
+            f"{category}={vendor or 'off'}" for category, vendor in (pipeline.get("data_vendors") or {}).items()
+        ) + "".join(f", {tool}={vendor}" for tool, vendor in (pipeline.get("tool_vendors") or {}).items()))),
+        ("Sweep",
+         f"cache dei fetch {_yes_no(sweep.get('cache_tool_fetches'))} &middot; finestre fisse "
+         f"{_yes_no(sweep.get('canonical_tool_windows'))} (news {sweep.get('news_lookback_days')} g, "
+         f"prezzi {sweep.get('price_lookback_days')} g) &middot; lezioni dalle decisioni passate "
+         f"{_yes_no(sweep.get('learn_from_past_decisions'))}"),
+        ("Strategia", escape(", ".join(
+            f"{rating} {weight:g}" for rating, weight in (strategy.get("positions") or {}).items()
+        )) + f" &middot; costo {strategy.get('cost_bps') or 0:g} bps"),
+    ]
+    body = "".join(f"<tr><th scope='row'>{label}</th><td>{value}</td></tr>" for label, value in rows)
+    return (
+        f"<table class='kv'><tbody>{body}</tbody></table>"
+        "<p class='note'>Due sweep sono confrontabili quando queste righe coincidono tranne il "
+        "modello. Il manifesto completo &egrave; in <code>manifest.json</code>, accanto al log.</p>"
+    )
+
+
 _CSS = """
 :root {
   color-scheme: light;
@@ -538,6 +636,11 @@ code { font-size: 12px; color: var(--ink-2); }
 .empty { color: var(--ink-muted); font-style: italic; }
 .empty.ok { color: var(--dir-up); font-style: normal; }
 .note { color: var(--ink-muted); font-size: 12.5px; max-width: 78ch; }
+.kv th { width: 26%; text-transform: none; letter-spacing: 0; font-size: 12.5px;
+  vertical-align: top; }
+.warn { color: var(--status-serious); }
+.warn-panel { border-left: 4px solid var(--status-warning); }
+.warn-panel p { margin: 6px 0 0; color: var(--ink-2); }
 @media (max-width: 560px) {
   body { padding: 24px 14px 60px; }
   .hero { font-size: 36px; }
@@ -574,14 +677,19 @@ def write_html_report(
     dates = sorted({e["date"] for e in entries})
     date_range = f"{dates[0]} → {dates[-1]}" if dates else "—"
     model = f"{config.get('llm_provider', '?')} / {config.get('deep_think_llm', '?')}, {config.get('quick_think_llm', '?')}"
+    commit = result.manifest.get("commit")
+    code = f" &middot; commit <code>{escape(commit[:7])}</code>" if commit else ""
+    if (result.manifest.get("code") or {}).get("uncommitted"):
+        code += " <span class='warn'>+ modifiche locali</span>"
 
     body = f"""
 <main>
 <header>
   <h1>Backtest {escape(', '.join(tickers))}</h1>
   <p class="sub">Run <code>{escape(result.run_id)}</code> &middot; {escape(date_range)}
-    &middot; {escape(model)} &middot; generato {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+    &middot; {escape(model)}{code} &middot; generato {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
 </header>
+{_mismatch_banner(result.manifest_mismatch)}
 
 <section>
   <h2>Seguendo le decisioni, contro comprare e tenere</h2>
@@ -635,6 +743,11 @@ def write_html_report(
   {_failures_table("Celle fallite", result.failures, ["Ticker", "Data", "Errore"])}
   {_failures_table("Settlement falliti", result.settlement_failures, ["Ticker", "Errore"])}
   {"<p class='empty ok'>Nessun fallimento.</p>" if not result.failures and not result.settlement_failures else ""}
+</section>
+
+<section>
+  <h2>Condizioni del run</h2>
+  {_manifest_section(result.manifest)}
 </section>
 
 <p class="note">{_metric_label(summary)} misurato su {escape(_holding_note(entries))} dopo ogni

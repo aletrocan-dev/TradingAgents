@@ -1476,6 +1476,12 @@ def backtest(
         TradingMemoryLog({"memory_log_path": str(result.log_path)}), result.metric
     ).render())
     console.print(f"\nRan {result.cells_run} cells, skipped {result.skipped}. Log: {result.log_path}")
+    if result.manifest_mismatch:
+        console.print(
+            f"[yellow]mixed conditions:[/yellow] this run's cells differ in "
+            f"{', '.join(result.manifest_mismatch)} from the manifest the sweep started under "
+            f"({result.log_path.parent / 'manifest.json'}); use a new --run-id to compare configurations"
+        )
     for ticker, date, reason in result.failures:
         console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {reason}")
     for ticker, reason in result.settlement_failures:

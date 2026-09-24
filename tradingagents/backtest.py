@@ -16,7 +16,12 @@ cell rather than a position carried forward.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
+import re
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -114,6 +119,221 @@ class BacktestResult:
     metric: str = "alpha"
     # Set once write_html_report() has run at the end of run_backtest().
     report_path: Path | None = None
+    # How this sweep was produced (see _run_manifest), and the sections that
+    # differ from the manifest the run was started under, when it was resumed.
+    manifest: dict = field(default_factory=dict)
+    manifest_mismatch: list[str] = field(default_factory=list)
+
+
+_REPO = Path(__file__).resolve().parent.parent
+
+# The manifest sections that decide what a cell computes. A resumed sweep is
+# checked against these only: extending the grid or re-reading the decisions
+# under other strategy weights leaves every existing cell valid.
+_CELL_SECTIONS = ("code", "model", "server", "pipeline", "sweep")
+
+
+def _git(*args: str) -> str | None:
+    try:
+        out = subprocess.run(["git", *args], cwd=_REPO, capture_output=True,
+                             text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def _code_state() -> dict:
+    """The code a sweep ran, as precisely as git can say.
+
+    Tree hashes of the two packages rather than the commit: a commit touching
+    only docs or tests changes nothing a cell computes, and must not read as a
+    different configuration on resume. Uncommitted edits are fingerprinted by
+    their content, since no hash in the history describes them.
+    """
+    if not (_REPO / ".git").exists():  # an installed package, not a checkout
+        return {}
+    dirty = "\n".join(filter(None, (
+        _git("status", "--porcelain", "--", "tradingagents", "cli"),
+        _git("diff", "HEAD", "--", "tradingagents", "cli"),
+    )))
+    return {
+        "tradingagents": _git("rev-parse", "HEAD:./tradingagents"),
+        "cli": _git("rev-parse", "HEAD:./cli"),
+        "uncommitted": hashlib.sha256(dirty.encode("utf-8")).hexdigest()[:12] if dirty else None,
+    }
+
+
+def _ollama_models(config: dict) -> dict | None:
+    """What each Ollama model name pointed at when the sweep ran.
+
+    A model name is a label: re-creating it from another Modelfile keeps the
+    name and changes the weights or the context window, and either changes the
+    answers. The digest and ``num_ctx`` pin what the name meant.
+    """
+    from urllib.request import Request, urlopen
+
+    base = (config.get("backend_url") or os.environ.get("OLLAMA_BASE_URL")
+            or "http://localhost:11434/v1")
+    root = base.rstrip("/").removesuffix("/v1")
+    if not root.startswith(("http://", "https://")):
+        return None
+
+    def call(path: str, payload: dict | None = None) -> dict:
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        request = Request(root + path, data=data, headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=5) as response:
+            return json.loads(response.read())
+
+    try:
+        digests = {m["name"]: m.get("digest") for m in call("/api/tags").get("models", [])}
+        models = {}
+        for name in sorted({config.get("deep_think_llm"), config.get("quick_think_llm")} - {None}):
+            shown = call("/api/show", {"model": name})
+            num_ctx = None
+            for line in (shown.get("parameters") or "").splitlines():
+                key, _, value = line.strip().partition(" ")
+                if key == "num_ctx":
+                    num_ctx = int(value.strip())
+            details = shown.get("details") or {}
+            digest = digests.get(name) or digests.get(f"{name}:latest")
+            models[name] = {
+                "digest": digest[:12] if digest else None,
+                "num_ctx": num_ctx,
+                "quantization": details.get("quantization_level"),
+                "parameters": details.get("parameter_size"),
+            }
+        return models
+    except Exception as exc:  # a best-effort record; the sweep itself says if Ollama is down
+        logger.warning("Could not read the Ollama model details from %s: %s", root, exc)
+        return None
+
+
+def _ollama_server_settings(config: dict) -> dict:
+    """The KV-cache settings the Ollama server runs with.
+
+    No API reports them, and this process's environment need not be the
+    server's: a terminal opened before the variables were set sees none of
+    them. The server prints its own configuration to its log when it starts,
+    so a local server is read from there, and anything else falls back to the
+    client's environment and says so.
+    """
+    from urllib.parse import urlparse
+
+    base = (config.get("backend_url") or os.environ.get("OLLAMA_BASE_URL")
+            or "http://localhost:11434/v1")
+    logs = [Path.home() / ".ollama" / "logs" / "server.log"]
+    if os.environ.get("LOCALAPPDATA"):
+        logs.insert(0, Path(os.environ["LOCALAPPDATA"]) / "Ollama" / "server.log")
+    if urlparse(base).hostname in ("localhost", "127.0.0.1", "::1"):
+        for log in logs:
+            try:
+                started = [line for line in log.read_text(encoding="utf-8", errors="replace").splitlines()
+                           if 'msg="server config"' in line]
+            except OSError:
+                continue
+            if started:
+                def setting(name: str, line: str = started[-1]) -> str:
+                    found = re.search(rf"\b{name}:(\S*)", line)
+                    return (found.group(1) if found else "") or "default"
+                return {"kv_cache_type": setting("OLLAMA_KV_CACHE_TYPE"),
+                        "flash_attention": setting("OLLAMA_FLASH_ATTENTION"),
+                        "read_from": "server log"}
+    return {"kv_cache_type": os.environ.get("OLLAMA_KV_CACHE_TYPE") or "default",
+            "flash_attention": os.environ.get("OLLAMA_FLASH_ATTENTION") or "default",
+            "read_from": "client environment"}
+
+
+def _number(value, kind):
+    return None if value is None or value == "" else kind(value)
+
+
+def _run_manifest(config: dict, tickers: list[str], dates: list[str], asset_type: str,
+                  selected_analysts) -> dict:
+    """Everything that decides what a sweep's numbers mean, in one record.
+
+    Two sweeps are comparable only when this matches except for the model, so
+    it is written beside the log and printed in the report.
+    """
+    gaps = {(datetime.strptime(b, "%Y-%m-%d") - datetime.strptime(a, "%Y-%m-%d")).days
+            for a, b in zip(dates, dates[1:], strict=False)}
+    manifest = {
+        "commit": _git("rev-parse", "HEAD") if (_REPO / ".git").exists() else None,
+        "code": _code_state(),
+        "model": {
+            "provider": config.get("llm_provider"),
+            "deep_think_llm": config.get("deep_think_llm"),
+            "quick_think_llm": config.get("quick_think_llm"),
+            # As the graph forwards them: from the environment they arrive as
+            # strings, and "8192" and 8192 must not read as two settings.
+            "temperature": _number(config.get("temperature"), float),
+            "max_tokens": _number(config.get("max_tokens"), int),
+        },
+        "server": None,
+        "grid": {
+            "tickers": list(tickers),
+            "asset_type": asset_type,
+            "first": dates[0] if dates else None,
+            "last": dates[-1] if dates else None,
+            "cells": len(tickers) * len(dates),
+            "every_days": gaps.pop() if len(gaps) == 1 else None,
+        },
+        "pipeline": {
+            "analysts": list(selected_analysts),
+            "max_debate_rounds": config.get("max_debate_rounds"),
+            "max_risk_discuss_rounds": config.get("max_risk_discuss_rounds"),
+            "holding_period_days": config.get("holding_period_days"),
+            "data_vendors": config.get("data_vendors"),
+            "tool_vendors": config.get("tool_vendors"),
+        },
+        "sweep": {
+            "cache_tool_fetches": config.get("cache_tool_fetches"),
+            "canonical_tool_windows": config.get("canonical_tool_windows"),
+            "news_lookback_days": config.get("news_lookback_days"),
+            "price_lookback_days": config.get("price_lookback_days"),
+            "learn_from_past_decisions": config.get("learn_from_past_decisions"),
+        },
+        "strategy": {
+            "positions": config.get("strategy_positions"),
+            "cost_bps": config.get("strategy_cost_bps"),
+        },
+    }
+    if config.get("llm_provider") == "ollama":
+        manifest["server"] = {"models": _ollama_models(config), **_ollama_server_settings(config)}
+    return manifest
+
+
+def _record_manifest(run_dir: Path, manifest: dict, prior_cells: int = 0) -> list[str]:
+    """Store a sweep's manifest, or on resume name what no longer matches.
+
+    A resumed sweep keeps the cells it already has, so continuing it under
+    other code, another model or another cache setting would mix two
+    configurations in one log without a trace. The manifest the sweep started
+    under stays the reference. Cells logged before any manifest existed are
+    of unknown provenance, and stay reported as such.
+    """
+    path = run_dir / "manifest.json"
+    if not path.exists():
+        original = {**manifest, "started_at": datetime.now().isoformat(timespec="seconds")}
+        if prior_cells:
+            original["cells_before_manifest"] = prior_cells
+        path.write_text(json.dumps(original, indent=2, default=str), encoding="utf-8")
+    else:
+        try:
+            original = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not read %s: %s", path, exc)
+            return []
+    mismatch = ["unrecorded"] if original.get("cells_before_manifest") else []
+    mismatch += [k for k in _CELL_SECTIONS
+                 if json.dumps(original.get(k), sort_keys=True, default=str)
+                 != json.dumps(manifest.get(k), sort_keys=True, default=str)]
+    if mismatch:
+        logger.warning(
+            "Sweep %s mixes cells produced under different conditions (%s): they are "
+            "not all comparable. Use a new --run-id to compare configurations.",
+            run_dir.name, ", ".join(mismatch),
+        )
+    return mismatch
 
 
 # What each rating claims will happen, so an outcome can be scored against it.
@@ -216,6 +436,8 @@ def run_backtest(
     graph = TradingAgentsGraph(selected_analysts, config=run_config)
     result = BacktestResult(run_id=run_id, log_path=Path(run_config["memory_log_path"]))
     done = {(e["ticker"], e["date"]) for e in graph.memory_log.load_entries()}
+    result.manifest = _run_manifest(run_config, tickers, dates, asset_type, selected_analysts)
+    result.manifest_mismatch = _record_manifest(run_dir, result.manifest, len(done))
 
     collector = fetch_issues.FetchIssueCollector()
     fetch_issues.set_collector(collector)

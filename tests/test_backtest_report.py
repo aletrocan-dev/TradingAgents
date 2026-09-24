@@ -271,3 +271,63 @@ def test_every_decision_is_listed_with_its_outcome(tmp_path):
     assert "+4.0%" in html            # l'alpha della cella risolta
     assert "in attesa" in html        # la pending si distingue
     assert "non valutabile" in html   # e la REVIEW pure
+
+
+_MANIFEST = {
+    "commit": "abcdef1234567890",
+    "code": {"tradingagents": "t", "cli": "c", "uncommitted": None},
+    "model": {"provider": "ollama", "deep_think_llm": "fin-r1:latest",
+              "quick_think_llm": "fin-r1:latest", "temperature": None, "max_tokens": 8192},
+    "server": {"models": {"fin-r1:latest": {"digest": "0a7ec91547b6", "num_ctx": 32768,
+                                            "quantization": "Q5_K_M", "parameters": "7.6B"}},
+               "kv_cache_type": "q8_0", "flash_attention": "true", "read_from": "server log"},
+    "grid": {"tickers": ["BTC-USD"], "asset_type": "crypto", "first": "2026-06-23",
+             "last": "2026-09-23", "cells": 93, "every_days": 1},
+    "pipeline": {"analysts": ["market", "news"], "max_debate_rounds": 1,
+                 "max_risk_discuss_rounds": 1, "holding_period_days": 1,
+                 "data_vendors": {"news_data": "yfinance", "prediction_markets": ""},
+                 "tool_vendors": {}},
+    "sweep": {"cache_tool_fetches": True, "canonical_tool_windows": True,
+              "news_lookback_days": 7, "price_lookback_days": 90,
+              "learn_from_past_decisions": False},
+    "strategy": {"positions": {"Buy": 1.0, "Sell": 0.0}, "cost_bps": 0.0},
+}
+
+
+def _html(tmp_path, **overrides):
+    result = _result(tmp_path, **overrides)
+    return write_html_report(result, _summary(), [_ENTRY], {}).read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_the_report_states_the_conditions_it_was_produced_under(tmp_path):
+    html = _html(tmp_path, manifest=_MANIFEST)
+    assert "Condizioni del run" in html
+    assert "abcdef1" in html                 # the commit, in the subtitle too
+    assert "0a7ec91547b6" in html            # which weights the model name meant
+    assert "32768" in html and "q8_0" in html
+    assert "max token in uscita 8192" in html
+    assert "prediction_markets=off" in html
+    assert "modifiche" not in html           # a clean tree says nothing about edits
+    assert "Celle prodotte in condizioni diverse" not in html
+
+
+@pytest.mark.unit
+def test_uncommitted_code_is_called_out(tmp_path):
+    manifest = {**_MANIFEST, "code": {**_MANIFEST["code"], "uncommitted": "4407a26cb020"}}
+    html = _html(tmp_path, manifest=manifest)
+    assert "modifiche non committate" in html and "4407a26cb020" in html
+
+
+@pytest.mark.unit
+def test_a_sweep_mixing_conditions_says_so_at_the_top(tmp_path):
+    html = _html(tmp_path, manifest=_MANIFEST, manifest_mismatch=["model", "unrecorded"])
+    assert "Celle prodotte in condizioni diverse" in html
+    assert html.index("Celle prodotte in condizioni diverse") < html.index("Seguendo le decisioni")
+    assert "modello o parametri di generazione" in html
+    assert "prima che esistesse un manifesto" in html
+
+
+@pytest.mark.unit
+def test_a_result_without_a_manifest_still_renders(tmp_path):
+    assert "Nessun manifesto registrato" in _html(tmp_path)

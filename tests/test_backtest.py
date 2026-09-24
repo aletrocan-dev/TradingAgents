@@ -291,3 +291,135 @@ def test_an_uneven_grid_keeps_the_configured_horizon(tmp_path):
     config = {**_config(tmp_path), "holding_period_days": 9}
     run_backtest(["NVDA"], ["2026-01-05", "2026-01-06", "2026-01-20"], config)
     assert _FakeGraph.instances[-1].config["holding_period_days"] == 9
+
+
+@pytest.mark.unit
+def test_a_sweep_never_learns_from_its_own_decisions(tmp_path):
+    """Each model would learn from its own earlier calls, so two sweeps would
+    feed their Portfolio Managers different lessons on the same cell."""
+    config = {**_config(tmp_path), "learn_from_past_decisions": True}
+    run_backtest(["NVDA"], ["2026-01-05"], config)
+    assert _FakeGraph.instances[-1].config["learn_from_past_decisions"] is False
+
+
+def _manifest(tmp_path, run_id="m"):
+    import json
+
+    path = tmp_path / "results" / "backtest" / run_id / "manifest.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.unit
+def test_the_conditions_of_a_sweep_are_written_beside_its_log(tmp_path):
+    config = {**_config(tmp_path), "llm_provider": "openai", "deep_think_llm": "deep-1",
+              "quick_think_llm": "quick-1", "max_tokens": "8192"}
+    result = run_backtest(["BTC-USD"], ["2026-01-05", "2026-01-06"], config,
+                          asset_type="crypto", selected_analysts=["market"], run_id="m")
+    stored = _manifest(tmp_path)
+    assert stored["model"]["deep_think_llm"] == "deep-1"
+    assert stored["model"]["max_tokens"] == 8192  # as forwarded, not as the env spelled it
+    assert stored["grid"] == {"tickers": ["BTC-USD"], "asset_type": "crypto", "first": "2026-01-05",
+                              "last": "2026-01-06", "cells": 2, "every_days": 1}
+    assert stored["pipeline"]["analysts"] == ["market"]
+    assert stored["pipeline"]["holding_period_days"] == 1
+    assert stored["sweep"]["learn_from_past_decisions"] is False
+    assert stored["started_at"]
+    assert result.manifest["model"] == stored["model"]
+    assert result.manifest_mismatch == []
+
+
+@pytest.mark.unit
+def test_resuming_under_another_model_is_flagged(tmp_path):
+    dates = ["2026-01-05", "2026-01-06"]
+    run_backtest(["NVDA"], dates, {**_config(tmp_path), "deep_think_llm": "a"}, run_id="m")
+    result = run_backtest(["NVDA"], [*dates, "2026-01-07"],
+                          {**_config(tmp_path), "deep_think_llm": "b"}, run_id="m")
+    assert result.manifest_mismatch == ["model"]
+    assert _manifest(tmp_path)["model"]["deep_think_llm"] == "a"  # the original stays the reference
+
+
+@pytest.mark.unit
+def test_extending_the_grid_at_the_same_step_is_not_a_change_of_conditions(tmp_path):
+    dates = ["2026-01-05", "2026-01-06"]
+    run_backtest(["NVDA"], dates, _config(tmp_path), run_id="m")
+    result = run_backtest(["NVDA"], [*dates, "2026-01-07"], _config(tmp_path), run_id="m")
+    assert result.manifest_mismatch == []
+    assert (result.skipped, result.cells_run) == (2, 1)
+
+
+@pytest.mark.unit
+def test_changing_the_step_changes_the_horizon_and_is_flagged(tmp_path):
+    run_backtest(["NVDA"], ["2026-01-05", "2026-01-06"], _config(tmp_path),
+                 asset_type="crypto", run_id="m")
+    result = run_backtest(["NVDA"], ["2026-01-05", "2026-01-07"], _config(tmp_path),
+                          asset_type="crypto", run_id="m")
+    assert result.manifest_mismatch == ["pipeline"]
+
+
+@pytest.mark.unit
+def test_cells_logged_before_any_manifest_stay_flagged(tmp_path):
+    log_path = tmp_path / "results" / "backtest" / "m" / "trading_memory.md"
+    TradingMemoryLog({"memory_log_path": str(log_path)}).store_decision("NVDA", "2026-01-05", DECISION)
+    first = run_backtest(["NVDA"], ["2026-01-05", "2026-01-06"], _config(tmp_path), run_id="m")
+    again = run_backtest(["NVDA"], ["2026-01-05", "2026-01-06"], _config(tmp_path), run_id="m")
+    assert first.manifest_mismatch == ["unrecorded"]
+    assert again.manifest_mismatch == ["unrecorded"]
+    assert _manifest(tmp_path)["cells_before_manifest"] == 1
+
+
+@pytest.mark.unit
+def test_the_ollama_server_settings_are_read_from_its_own_log(tmp_path, monkeypatch):
+    from tradingagents.backtest import _ollama_server_settings
+
+    log = tmp_path / "Ollama" / "server.log"
+    log.parent.mkdir()
+    log.write_text(
+        'time=1 msg="server config" env="map[OLLAMA_FLASH_ATTENTION:false OLLAMA_KV_CACHE_TYPE:]"\n'
+        'time=2 msg="server config" env="map[OLLAMA_FLASH_ATTENTION:true OLLAMA_KV_CACHE_TYPE:q8_0 X:y]"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("OLLAMA_KV_CACHE_TYPE", "f16")  # a terminal's stale view must not win
+    settings = _ollama_server_settings({"backend_url": "http://localhost:11434/v1"})
+    assert settings == {"kv_cache_type": "q8_0", "flash_attention": "true", "read_from": "server log"}
+
+    remote = _ollama_server_settings({"backend_url": "http://gpu-box:11434/v1"})
+    assert remote["read_from"] == "client environment"
+    assert remote["kv_cache_type"] == "f16"
+
+
+@pytest.mark.unit
+def test_an_ollama_model_name_is_pinned_to_its_weights_and_context(monkeypatch):
+    import io
+    import json
+    import urllib.request
+
+    from tradingagents.backtest import _ollama_models
+
+    replies = {
+        "/api/tags": {"models": [{"name": "fin-r1:latest", "digest": "0a7ec91547b6ffff"}]},
+        "/api/show": {"parameters": 'num_ctx                        32768\nstop "<|im_end|>"',
+                      "details": {"quantization_level": "Q5_K_M", "parameter_size": "7.6B"}},
+    }
+
+    def fake_urlopen(request, timeout):
+        return io.BytesIO(json.dumps(replies[request.full_url.split("11434")[1]]).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    models = _ollama_models({"backend_url": "http://localhost:11434/v1",
+                             "deep_think_llm": "fin-r1:latest", "quick_think_llm": "fin-r1:latest"})
+    assert models == {"fin-r1:latest": {"digest": "0a7ec91547b6", "num_ctx": 32768,
+                                        "quantization": "Q5_K_M", "parameters": "7.6B"}}
+
+
+@pytest.mark.unit
+def test_an_unreachable_ollama_does_not_stop_the_sweep(monkeypatch):
+    import urllib.request
+
+    from tradingagents.backtest import _ollama_models
+
+    def refuse(request, timeout):
+        raise ConnectionRefusedError("no server")
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    assert _ollama_models({"backend_url": "http://localhost:11434/v1", "deep_think_llm": "x"}) is None

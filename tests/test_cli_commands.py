@@ -75,6 +75,8 @@ class _Result:
         self.report_path = tmp_path / "report.html"
         self.curves = []
         self.metric = "alpha"
+        self.manifest = {}
+        self.manifest_mismatch = []
 
 
 class _Summary:
