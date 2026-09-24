@@ -266,3 +266,11 @@ def test_prose_without_a_box_is_read_exactly_as_before():
     assert extract_rating(INVERTED) == "Underweight"
     assert extract_rating("The bull wants Buy, the bear wants Sell.") is None
     assert parse_rating(REFUSAL) == RATING_REVIEW
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("boxed", ["\x08oxed{Underweight}", "\x08oxed{\\text{Underweight}}"])
+def test_a_box_survives_json_decoding_its_backslash_b_into_a_backspace(boxed):
+    """A structured answer carrying ``"\\boxed{X}"`` with one backslash decodes
+    ``\\b`` as a backspace: the text reaches the parser as ``\\x08oxed{X}``."""
+    assert extract_rating(f"Buy was argued and rejected.\n\n{boxed}") == "Underweight"

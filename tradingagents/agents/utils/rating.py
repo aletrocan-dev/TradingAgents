@@ -39,8 +39,10 @@ _RATING_LABEL_RE = re.compile(r"rating\b[^:\-\u2010-\u2015]*[:\-\u2010-\u2015][\
 
 # A reasoning model in the R1 family ends on \boxed{...}: its own marker
 # for "this is the answer", so it reads as a label rather than as prose. Tolerates
-# a LaTeX wrapper (\boxed{\text{Hold}}) and markdown inside the box.
-_BOXED_RE = re.compile(r"\\boxed\s*\{\s*(?:\\\w+\s*\{\s*)?[*\s]*([A-Za-z]+)")
+# a LaTeX wrapper (\boxed{\text{Hold}}) and markdown inside the box. A box that
+# went through a JSON decoder arrives as a backspace plus "oxed": JSON reads the
+# "\b" as its own escape, so the model's answer must survive that too.
+_BOXED_RE = re.compile(r"(?:\\b|\x08)oxed\s*\{\s*(?:\\\w+\s*\{\s*)?[*\s]*([A-Za-z]+)")
 
 # A line presenting the scale rather than a decision ("Rating Scale: Buy, ...").
 _RATING_SCALE_RE = re.compile(r"rating\s*(scale|options|legend)", re.IGNORECASE)
