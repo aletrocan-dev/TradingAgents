@@ -99,6 +99,52 @@ def test_openai_and_google_clients_accept_the_kwarg():
     assert getattr(llm, "max_output_tokens", None) == 8192
 
 
+# --- what reaches the wire --------------------------------------------------
+
+def _wire(provider: str, model: str) -> dict:
+    """The request body the client would send, minus the conversation."""
+    from tradingagents.llm_clients import create_llm_client
+
+    llm = create_llm_client(provider, model, None, max_tokens=8192).get_llm()
+    return {k: v for k, v in llm._get_request_payload([("user", "hi")]).items() if k != "messages"}
+
+
+@pytest.mark.unit
+def test_ollama_receives_the_cap_under_the_name_it_reads():
+    """Ollama ignores ``max_completion_tokens``, the name langchain-openai
+    sends: the cap was configured, forwarded to the client, and never applied —
+    a sweep ran one generation past 125,000 tokens. Checking the constructor
+    kwarg (above) could not catch that; only the request body can."""
+    body = _wire("ollama", "fin-r1-32k:latest")
+    assert body.get("max_tokens") == 8192
+    assert "max_completion_tokens" not in body
+
+
+@pytest.mark.unit
+def test_ollama_structured_calls_carry_the_cap_too():
+    from pydantic import BaseModel
+
+    from tradingagents.llm_clients import create_llm_client
+
+    class Answer(BaseModel):
+        rating: str
+
+    llm = create_llm_client("ollama", "fin-r1-32k:latest", None, max_tokens=8192).get_llm()
+    bound = llm.with_structured_output(Answer).first  # the tool-bound model, before parsing
+    body = bound.bound._get_request_payload([("user", "hi")], **bound.kwargs)
+    assert body.get("max_tokens") == 8192
+    assert "max_completion_tokens" not in body
+
+
+@pytest.mark.unit
+def test_openai_itself_keeps_the_name_its_own_api_requires():
+    """The rename is for local servers only: OpenAI's reasoning models reject
+    ``max_tokens``, and the client names the cap for the API it calls."""
+    body = _wire("openai", "gpt-5.6")
+    assert "max_tokens" not in body
+    assert 8192 in body.values()
+
+
 # --- env overlay -----------------------------------------------------------
 
 def _reload_with_env(monkeypatch, **overrides):

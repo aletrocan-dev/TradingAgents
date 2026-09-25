@@ -67,6 +67,18 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
             kwargs.setdefault("tool_choice", None)
         return super().with_structured_output(schema, method=method, **kwargs)
 
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        # langchain-openai sends the output cap as ``max_completion_tokens``,
+        # the name OpenAI's reasoning models require. Ollama's compatibility
+        # layer reads only ``max_tokens`` and silently drops the other, so the
+        # cap never applied: a fin-r1 sweep ran one generation past 125,000
+        # tokens, through a context shift every 16k that discarded the prompt's
+        # instructions. Every OpenAI-compatible local server reads ``max_tokens``.
+        if "max_completion_tokens" in payload and "max_tokens" not in payload:
+            payload["max_tokens"] = payload.pop("max_completion_tokens")
+        return payload
+
 
 def _input_to_messages(input_: Any) -> list:
     """Normalise a langchain LLM input to a list of message objects.
