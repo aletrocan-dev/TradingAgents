@@ -49,6 +49,13 @@ class StrategyCurve:
     final_position: float = 0.0
     cost_bps: float = 0.0
     rule: dict[str, float] = field(default_factory=dict)
+    # Set when the decisions were read as orders rather than targets (see
+    # build_curve): rating -> fraction of the portfolio bought (+) or sold (-).
+    trades: dict[str, float] | None = None
+    # Mean position over the bars, as a fraction of the portfolio.
+    @property
+    def average_exposure(self) -> float:
+        return sum(self.positions) / len(self.positions) if self.positions else 0.0
 
     @property
     def strategy_return(self) -> float:
@@ -86,6 +93,31 @@ def _target_positions(config: dict) -> dict[str, float]:
     return {**DEFAULT_POSITIONS, **(config.get("strategy_positions") or {})}
 
 
+def parse_trades(text: str) -> dict[str, float]:
+    """``"Buy=1,Overweight=0.5,Underweight=-0.5,Sell=-1"`` as an order rule.
+
+    Ratings match the five tiers whatever their case; a fraction is of the
+    whole portfolio, between -1 (sell it all) and 1 (buy with all of it).
+    """
+    tiers = {t.lower(): t for t in DEFAULT_POSITIONS}
+    trades: dict[str, float] = {}
+    for part in filter(None, (p.strip() for p in text.split(","))):
+        name, sep, value = part.partition("=")
+        tier = tiers.get(name.strip().lower())
+        if not sep or tier is None:
+            raise ValueError(f"expected Rating=fraction with a rating among {list(tiers.values())}, got {part!r}")
+        try:
+            fraction = float(value.replace("%", "")) / (100 if "%" in value else 1)
+        except ValueError:
+            raise ValueError(f"not a fraction: {part!r}") from None
+        if not -1.0 <= fraction <= 1.0:
+            raise ValueError(f"a trade is at most the whole portfolio (-1..1), got {part!r}")
+        trades[tier] = fraction
+    if not trades:
+        raise ValueError("no trade given")
+    return trades
+
+
 def build_curve(entries: list[dict], ticker: str, config: dict,
                 until: str | None = None) -> StrategyCurve | None:
     """Follow ``ticker``'s decisions bar by bar; ``None`` when it has none.
@@ -103,6 +135,14 @@ def build_curve(entries: list[dict], ticker: str, config: dict,
 
     ``until`` ends the curve at that date's close instead, so a sweep still
     running can be read up to the cell it has reached.
+
+    With ``config["strategy_trades"]`` set, a rating is read as an order
+    rather than a target: it buys (+) or sells (-) that fraction of the whole
+    portfolio's value, from a start all in cash. Buying is limited to the cash
+    there is and selling to what is held — no leverage, no short — so the
+    position stays within 0..100%. A rating without an order (Hold, unless
+    given one) trades nothing. Between orders the position is left alone, so
+    its share of the portfolio moves with the price, as coins held would.
     """
     today = get_current_date()
     last = until or today
@@ -114,6 +154,7 @@ def build_curve(entries: list[dict], ticker: str, config: dict,
         return None
 
     rule = _target_positions(config)
+    trades = config.get("strategy_trades") or None
     cost_bps = float(config.get("strategy_cost_bps") or 0.0)
 
     prices = load_ohlcv(ticker, last, fill_gaps=False)
@@ -135,21 +176,27 @@ def build_curve(entries: list[dict], ticker: str, config: dict,
 
     curve = StrategyCurve(
         ticker=ticker, dates=[rows["Date"].iloc[0].strftime("%Y-%m-%d")],
-        strategy=[1.0], buy_hold=[1.0], cost_bps=cost_bps, rule=rule,
+        strategy=[1.0], buy_hold=[1.0], cost_bps=cost_bps, rule=rule, trades=trades,
     )
-    position = 0.0
+    position = 0.0   # the asset's share of the portfolio's value
 
     def act(bar: int) -> None:
         nonlocal position
         signal = by_bar.get(bar)
         if signal is None:
             return
-        curve.markers.append((bar, signal["rating"]))
-        if signal["rating"] == RATING_REVIEW or signal["rating"] not in rule:
+        rating = signal["rating"]
+        curve.markers.append((bar, rating))
+        if rating == RATING_REVIEW or (trades is None and rating not in rule):
             curve.carried += 1
             return
-        target = rule[signal["rating"]]
-        if target == position:
+        if trades is not None:
+            target = min(1.0, max(0.0, position + trades.get(rating, 0.0)))
+        else:
+            target = rule[rating]
+        # A tolerance, not equality: a position drifted with the price reads
+        # 0.9999999999 where it is simply all in, and buying more is no trade.
+        if abs(target - position) < 1e-9:
             return
         curve.strategy[-1] *= 1 - abs(target - position) * cost_bps / 10_000
         curve.changes += 1
@@ -163,6 +210,10 @@ def build_curve(entries: list[dict], ticker: str, config: dict,
         curve.buy_hold.append(curve.buy_hold[-1] * (1 + ret))
         curve.dates.append(rows["Date"].iloc[i].strftime("%Y-%m-%d"))
         curve.positions.append(position)
+        if trades is not None:
+            # Nothing is rebalanced between orders: the coins held are what
+            # they were, so their share of the portfolio moves with the price.
+            position = position * (1 + ret) / (1 + position * ret)
         act(i)
 
     curve.final_position = position

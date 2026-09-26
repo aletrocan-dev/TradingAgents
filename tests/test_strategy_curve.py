@@ -155,3 +155,77 @@ def test_a_bar_still_trading_today_is_left_out(monkeypatch):
     monkeypatch.setattr("tradingagents.strategy_curve.get_current_date", lambda: "2026-01-06")
     curve = build_curve(_entries(("2026-01-01", "Hold")), "BTC-USD", {})
     assert curve.dates[-1] == "2026-01-05"
+
+
+# --- decisions read as orders on the portfolio -------------------------------
+# CLOSES = 100, 105, 110, 105, 100, 95 on 01-01..01-06. Expected values are
+# worked out by hand from cash and coins held, not from the code under test.
+
+ORDERS = {"Buy": 1.0, "Overweight": 0.5, "Underweight": -0.5, "Sell": -1.0}
+
+
+def _orders(*pairs):
+    return build_curve(_entries(*pairs), "BTC-USD", {"strategy_trades": ORDERS})
+
+
+@pytest.mark.unit
+def test_buying_with_everything_is_buy_and_hold():
+    curve = _orders(("2026-01-01", "Buy"))
+    assert curve.strategy == pytest.approx(curve.buy_hold)
+
+
+@pytest.mark.unit
+def test_half_the_portfolio_bought_is_held_as_coins_not_rebalanced():
+    """0.5 in cash and 0.5 in coins bought at 100: at 95 that is
+    0.5 + 0.5 * 0.95 = 0.975. Keeping a constant 50% weight would give
+    another number; nobody holding coins rebalances every day."""
+    curve = _orders(("2026-01-01", "Overweight"))
+    assert curve.strategy[-1] == pytest.approx(0.975)
+    assert curve.positions[0] == pytest.approx(0.5)
+    assert curve.positions[1] == pytest.approx(0.5 * 1.05 / 1.025)  # drifted with the price
+
+
+@pytest.mark.unit
+def test_selling_half_the_portfolio_sells_half_its_value():
+    """All in at 100; at 110 the portfolio is 1.10 and Underweight sells 0.55
+    of it, leaving 0.55 in coins that are worth 0.55 * 95 / 110 at the end."""
+    curve = _orders(("2026-01-01", "Buy"), ("2026-01-03", "Underweight"))
+    assert curve.strategy[-1] == pytest.approx(0.55 + 0.55 * 95 / 110)
+    assert curve.final_position == pytest.approx(0.55 * 95 / 110 / (0.55 + 0.55 * 95 / 110))
+
+
+@pytest.mark.unit
+def test_there_is_no_short_and_no_leverage():
+    out = _orders(("2026-01-01", "Sell"), ("2026-01-02", "Underweight"))
+    assert out.strategy == pytest.approx([1.0] * 6) and out.changes == 0
+    full = _orders(("2026-01-01", "Overweight"), ("2026-01-02", "Overweight"),
+                   ("2026-01-03", "Buy"))
+    assert full.changes == 2                      # the third order finds no cash left
+    assert max(full.positions) <= 1.0 + 1e-12
+
+
+@pytest.mark.unit
+def test_hold_trades_nothing_and_review_is_counted_as_unreadable():
+    curve = _orders(("2026-01-01", "Overweight"), ("2026-01-02", "Hold"), ("2026-01-03", "REVIEW"))
+    assert curve.strategy[-1] == pytest.approx(0.975)
+    assert (curve.changes, curve.carried) == (1, 1)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("text, expected", [
+    ("Buy=1,Overweight=0.5,Underweight=-0.5,Sell=-1", ORDERS),
+    ("buy=100%, sell=-100%", {"Buy": 1.0, "Sell": -1.0}),
+])
+def test_an_order_rule_reads_from_one_line(text, expected):
+    from tradingagents.strategy_curve import parse_trades
+
+    assert parse_trades(text) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("text", ["Moon=1", "Buy", "Buy=two", "Buy=1.5", ""])
+def test_an_order_rule_that_makes_no_sense_is_refused(text):
+    from tradingagents.strategy_curve import parse_trades
+
+    with pytest.raises(ValueError):
+        parse_trades(text)

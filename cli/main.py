@@ -1516,10 +1516,21 @@ def backtest(
 @app.command()
 def report(
     run_id: str = typer.Argument(..., help="The --run-id of a finished sweep"),
+    trades: str = typer.Option(
+        None, "--trades",
+        help="Read the decisions as orders on the portfolio instead, e.g. "
+        "'Buy=1,Overweight=0.5,Underweight=-0.5,Sell=-1' (buy 100%%, buy 50%%, sell 50%%, "
+        "sell 100%% of its value); a rating left out trades nothing. Written to "
+        "report_trades.html unless --out says otherwise.",
+    ),
+    out: str = typer.Option(None, "--out", help="File name for the report, beside the log"),
 ):
     """Write a finished sweep's HTML report again, without re-running any cell."""
+    from tradingagents.strategy_curve import parse_trades
+
     try:
-        result = rebuild_report(run_id, DEFAULT_CONFIG)
+        result = rebuild_report(run_id, DEFAULT_CONFIG,
+                                trades=parse_trades(trades) if trades else None, filename=out)
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from None

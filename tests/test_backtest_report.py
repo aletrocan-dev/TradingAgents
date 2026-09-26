@@ -331,3 +331,20 @@ def test_a_sweep_mixing_conditions_says_so_at_the_top(tmp_path):
 @pytest.mark.unit
 def test_a_result_without_a_manifest_still_renders(tmp_path):
     assert "Nessun manifesto registrato" in _html(tmp_path)
+
+
+@pytest.mark.unit
+def test_orders_are_described_as_orders(tmp_path):
+    from tradingagents.strategy_curve import StrategyCurve
+
+    curve = StrategyCurve(ticker="BTC-USD", dates=["2026-01-01", "2026-01-02"], strategy=[1.0, 1.02],
+                          buy_hold=[1.0, 1.05], positions=[0.5], markers=[(0, "Overweight")],
+                          final_position=0.5, changes=1,
+                          trades={"Buy": 1.0, "Overweight": 0.5, "Underweight": -0.5, "Sell": -1.0})
+    html = _html(tmp_path, curves=[curve])
+    assert "come ordini" in html
+    assert ("Buy compra il 100% del patrimonio, Overweight compra il 50% del patrimonio, "
+            "Underweight vende il 50% del patrimonio, Sell vende il 100% del patrimonio, "
+            "Hold non muove nulla") in html
+    assert "esposizione media" in html and "operazioni" in html
+    assert "niente leva" in html

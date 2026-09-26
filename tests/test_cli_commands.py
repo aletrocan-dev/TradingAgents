@@ -197,17 +197,17 @@ def test_a_start_after_today_is_refused_before_anything_runs(runner):
 @pytest.mark.unit
 def test_report_rewrites_a_finished_sweep_s_report(runner, monkeypatch, tmp_path):
     asked = []
-    monkeypatch.setattr(m, "rebuild_report", lambda run_id, config: asked.append(run_id) or _Result(tmp_path))
+    monkeypatch.setattr(m, "rebuild_report", lambda run_id, config, **kw: asked.append((run_id, kw)) or _Result(tmp_path))
     result = runner.invoke(m.app, ["report", "btc_3m_finr1"])
     assert result.exit_code == 0, result.output
-    assert asked == ["btc_3m_finr1"]
+    assert asked == [("btc_3m_finr1", {"trades": None, "filename": None})]
     assert "report.html" in result.output
     assert calls == []  # no analysis, no sweep
 
 
 @pytest.mark.unit
 def test_report_says_so_when_there_is_no_such_sweep(runner, monkeypatch):
-    def missing(run_id, config):
+    def missing(run_id, config, **kw):
         raise FileNotFoundError(f"No sweep '{run_id}' under /results/backtest")
 
     monkeypatch.setattr(m, "rebuild_report", missing)

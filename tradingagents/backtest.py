@@ -335,6 +335,7 @@ def _run_manifest(config: dict, tickers: list[str], dates: list[str], asset_type
         },
         "strategy": {
             "positions": config.get("strategy_positions"),
+            "trades": config.get("strategy_trades"),
             "cost_bps": config.get("strategy_cost_bps"),
         },
     }
@@ -592,7 +593,8 @@ def _whole_sweep(result: BacktestResult, state: dict) -> BacktestResult:
     )
 
 
-def rebuild_report(run_id: str, config: dict) -> BacktestResult:
+def rebuild_report(run_id: str, config: dict, trades: dict[str, float] | None = None,
+                   filename: str | None = None) -> BacktestResult:
     """Write a finished sweep's report again from what it left on disk.
 
     Nothing is re-run and nothing the sweep recorded is changed: its
@@ -600,6 +602,12 @@ def rebuild_report(run_id: str, config: dict) -> BacktestResult:
     fetch issues are read back as they are. Only the reading is redone with
     the current code, under the holding window and strategy rule the sweep
     ran with, so two sweeps' reports can be brought to the same reading.
+
+    ``trades`` reads the same decisions as orders instead (see
+    ``strategy_curve.build_curve``) into ``filename`` (``report_trades.html``
+    by default), leaving the sweep's own report as it is. The strategy row of
+    the report's conditions then names that rule: it is the reading, not a
+    condition any decision was made under.
     """
     run_id = safe_ticker_component(run_id)
     run_dir = Path(config["results_dir"]) / "backtest" / run_id
@@ -618,8 +626,14 @@ def rebuild_report(run_id: str, config: dict) -> BacktestResult:
         "quick_think_llm": model.get("quick_think_llm", config.get("quick_think_llm")),
         "holding_period_days": pipeline.get("holding_period_days", config.get("holding_period_days")),
         "strategy_positions": strategy.get("positions", config.get("strategy_positions")),
+        "strategy_trades": trades if trades is not None else strategy.get("trades", config.get("strategy_trades")),
         "strategy_cost_bps": strategy.get("cost_bps", config.get("strategy_cost_bps")),
     }
+    if trades is not None:
+        manifest = {**manifest, "strategy": {**strategy, "trades": trades}}
+    filename = filename or ("report_trades.html" if trades is not None else "report.html")
+    if Path(filename).name != filename or not filename.endswith(".html"):
+        raise ValueError(f"the report is written beside the log: give a file name ending in .html, got {filename!r}")
     memory_log = TradingMemoryLog({"memory_log_path": str(log_path)})
     entries = memory_log.load_entries()
     crypto = (manifest.get("grid") or {}).get("asset_type") == "crypto"
@@ -636,7 +650,7 @@ def rebuild_report(run_id: str, config: dict) -> BacktestResult:
     )
     result.curves = build_curves(entries, reading)
     result.report_path = write_html_report(result, summarize(memory_log, result.metric),
-                                           entries, reading)
+                                           entries, reading, filename=filename)
     return result
 
 

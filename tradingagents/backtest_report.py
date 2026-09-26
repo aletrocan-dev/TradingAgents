@@ -347,24 +347,49 @@ def _strategy_section(curves: list) -> str:
             f"<div class='legend legend-marks'>{_MARKER_KEY}</div>"
             "<div class='tiles'>"
             + _tile(f"{curve.time_in_market:.0%}", "tempo a mercato")
-            + _tile(str(curve.changes), "cambi di posizione")
+            + (_tile(f"{curve.average_exposure:.0%}", "esposizione media")
+               if curve.trades is not None else "")
+            + _tile(str(curve.changes), "operazioni" if curve.trades is not None
+                    else "cambi di posizione")
             + _tile(f"{curve.max_drawdown('strategy'):.1%}", "drawdown strategia")
             + _tile(f"{curve.max_drawdown('buy_hold'):.1%}", "drawdown buy & hold")
             + "</div></div>"
         )
-    rule = curves[0].rule
-    weights = ", ".join(f"{k} {v:.0%}" for k, v in rule.items())
     costs = (f"{curves[0].cost_bps:.0f} bps per cambio di posizione"
              if curves[0].cost_bps else "nessun costo di transazione")
     carried = sum(c.carried for c in curves)
     note = (f" {carried} decisione/i senza rating leggibile hanno mantenuto la posizione."
             if carried else "")
+    if curves[0].trades is not None:
+        blocks.append(
+            f"<p class='note'>Regola applicata, le decisioni come ordini: "
+            f"{escape(_describe_trades(curves[0].trades))}. Si parte tutto in liquidità; "
+            "gli acquisti sono limitati alla liquidità e le vendite a quanto posseduto, "
+            "quindi niente leva né vendite allo scoperto (posizione tra 0% e 100%). Tra "
+            "un ordine e l'altro la posizione non viene ribilanciata: il suo peso segue "
+            f"il prezzo. Ogni decisione agisce dalla chiusura del suo giorno; {costs}.{note} "
+            "Non modella slippage né un portafoglio con più strumenti.</p>"
+        )
+        return "".join(blocks)
+    weights = ", ".join(f"{k} {v:.0%}" for k, v in curves[0].rule.items())
     blocks.append(
         f"<p class='note'>Regola applicata: {escape(weights)}. Ogni decisione agisce "
         f"dalla chiusura del suo giorno; {costs}.{note} Non modella size, leva, "
         f"slippage né un portafoglio con più strumenti.</p>"
     )
     return "".join(blocks)
+
+
+def _describe_trades(trades: dict[str, float]) -> str:
+    """``Buy compra il 100% del patrimonio, ..., Hold non muove nulla``."""
+    parts = [
+        f"{rating} {'compra' if fraction > 0 else 'vende'} il {abs(fraction):.0%} del patrimonio"
+        for rating, fraction in trades.items() if fraction
+    ]
+    idle = [r for r in ("Buy", "Overweight", "Hold", "Underweight", "Sell") if not trades.get(r)]
+    if idle:
+        parts.append(f"{', '.join(idle)} non {'muove' if len(idle) == 1 else 'muovono'} nulla")
+    return ", ".join(parts)
 
 
 def _distinct_issues(fetch_issues: list[dict]) -> list[tuple[tuple, int]]:
@@ -551,9 +576,11 @@ def _manifest_section(manifest: dict) -> str:
          f"{_yes_no(sweep.get('canonical_tool_windows'))} (news {sweep.get('news_lookback_days')} g, "
          f"prezzi {sweep.get('price_lookback_days')} g) &middot; lezioni dalle decisioni passate "
          f"{_yes_no(sweep.get('learn_from_past_decisions'))}"),
-        ("Strategia", escape(", ".join(
-            f"{rating} {weight:g}" for rating, weight in (strategy.get("positions") or {}).items()
-        )) + f" &middot; costo {strategy.get('cost_bps') or 0:g} bps"),
+        ("Strategia", escape(
+            "ordini: " + _describe_trades(strategy["trades"]) if strategy.get("trades")
+            else ", ".join(f"{rating} {weight:g}"
+                           for rating, weight in (strategy.get("positions") or {}).items())
+        ) + f" &middot; costo {strategy.get('cost_bps') or 0:g} bps"),
     ]
     body = "".join(f"<tr><th scope='row'>{label}</th><td>{value}</td></tr>" for label, value in rows)
     return (
@@ -668,6 +695,7 @@ def write_html_report(
     summary: BacktestSummary,
     entries: list[dict],
     config: dict,
+    filename: str = "report.html",
 ) -> Path:
     """Write a self-contained HTML report next to the run's decision log.
 
@@ -692,7 +720,7 @@ def write_html_report(
 {_mismatch_banner(result.manifest_mismatch)}
 
 <section>
-  <h2>Seguendo le decisioni, contro comprare e tenere</h2>
+  <h2>Seguendo le decisioni{" come ordini" if any(c.trades is not None for c in result.curves) else ""}, contro comprare e tenere</h2>
   {_strategy_section(result.curves)}
 </section>
 
@@ -761,6 +789,6 @@ def write_html_report(
            f"<title>Backtest {escape(result.run_id)}</title><style>{_CSS}</style></head>" \
            f"<body>{body}</body></html>"
 
-    report_path = result.log_path.parent / "report.html"
+    report_path = result.log_path.parent / filename
     report_path.write_text(html, encoding="utf-8")
     return report_path

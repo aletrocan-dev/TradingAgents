@@ -139,6 +139,12 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "strategy_positions": {
         "Buy": 1.0, "Overweight": 1.0, "Hold": 1.0, "Underweight": 0.0, "Sell": 0.0,
     },
+    # Read the ratings as orders instead: rating -> fraction of the portfolio
+    # bought (+) or sold (-), e.g. {"Buy": 1.0, "Overweight": 0.5,
+    # "Underweight": -0.5, "Sell": -1.0}; a rating left out trades nothing.
+    # None keeps strategy_positions. `tradingagents report <run> --trades`
+    # applies one to a finished sweep.
+    "strategy_trades": None,
     # Round-trip cost charged on turnover at each position change, in basis
     # points. Zero makes beating buy & hold look easier than it is.
     "strategy_cost_bps": 0.0,

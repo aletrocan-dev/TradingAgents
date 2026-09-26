@@ -589,3 +589,34 @@ def test_there_is_no_report_to_rebuild_for_a_sweep_that_never_ran(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="No sweep 'ghost'"):
         rebuild_report("ghost", _config(tmp_path))
+
+
+@pytest.mark.unit
+def test_a_report_can_read_the_same_decisions_as_orders(tmp_path, monkeypatch, _offline_curves):
+    import tradingagents.backtest as bt
+    from tradingagents.backtest import rebuild_report
+
+    run_backtest(["BTC-USD"], ["2026-01-05", "2026-01-06"], _config(tmp_path),
+                 asset_type="crypto", run_id="s")
+    run_dir = tmp_path / "results" / "backtest" / "s"
+    own_report = (run_dir / "report.html").read_text(encoding="utf-8")
+    readings = []
+    monkeypatch.setattr(bt, "build_curves", lambda entries, config: readings.append(config) or [])
+
+    orders = {"Buy": 1.0, "Overweight": 0.5, "Underweight": -0.5, "Sell": -1.0}
+    result = rebuild_report("s", _config(tmp_path), trades=orders)
+
+    assert result.report_path == run_dir / "report_trades.html"
+    assert readings[0]["strategy_trades"] == orders
+    assert (run_dir / "report.html").read_text(encoding="utf-8") == own_report  # left as it was
+    assert "ordini: Buy compra il 100% del patrimonio" in result.report_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", ["../elsewhere.html", "report.txt", "sub/report.html"])
+def test_a_rebuilt_report_stays_beside_its_log(tmp_path, _offline_curves, name):
+    from tradingagents.backtest import rebuild_report
+
+    run_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path), run_id="s")
+    with pytest.raises(ValueError, match="file name ending in .html"):
+        rebuild_report("s", _config(tmp_path), filename=name)
