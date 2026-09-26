@@ -495,3 +495,97 @@ def test_unreachable_prices_leave_the_cell_reported_without_a_curve(tmp_path, mo
     seen = []
     run_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path), on_cell=seen.append)
     assert len(seen) == 1 and seen[0].curve is None
+
+
+@pytest.fixture
+def _offline_curves(monkeypatch):
+    import tradingagents.backtest as bt
+
+    monkeypatch.setattr(bt, "build_curves", lambda entries, config: [])
+    monkeypatch.setattr(bt, "build_curve", lambda *a, **k: None)
+
+
+def _issue_on(monkeypatch, cells):
+    """Make the fake graph hit a fetch issue in the given cells."""
+    from tradingagents.dataflows import fetch_issues
+
+    original = _FakeGraph.propagate
+
+    def propagate(self, ticker, trade_date, *args, **kwargs):
+        if (ticker, trade_date) in cells:
+            fetch_issues.record("get_news", "no_coverage", f"nothing for {trade_date}", (ticker,))
+        return original(self, ticker, trade_date, *args, **kwargs)
+
+    monkeypatch.setattr(_FakeGraph, "propagate", propagate)
+
+
+def _sweep_state(tmp_path, run_id="s"):
+    import json
+
+    return json.loads((tmp_path / "results" / "backtest" / run_id / "sweep.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.unit
+def test_what_a_sweep_recorded_outlives_the_process(tmp_path, monkeypatch, _offline_curves):
+    _issue_on(monkeypatch, {("NVDA", "2026-01-05")})
+    run_backtest(["NVDA"], ["2026-01-05", "2026-01-06"], _config(tmp_path), run_id="s")
+    state = _sweep_state(tmp_path)
+    assert [(i["date"], i["reason"]) for i in state["fetch_issues"]] == [("2026-01-05", "no_coverage")]
+    assert state["metric"] == "alpha" and state["failures"] == []
+
+
+@pytest.mark.unit
+def test_a_resumed_sweep_keeps_every_session_s_issues(tmp_path, monkeypatch, _offline_curves):
+    import tradingagents.backtest as bt
+
+    _issue_on(monkeypatch, {("NVDA", "2026-01-05"), ("NVDA", "2026-01-06")})
+    written = []
+    monkeypatch.setattr(bt, "write_html_report", lambda result, *a: written.append(result) or None)
+    run_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path), run_id="s")
+    run_backtest(["NVDA"], ["2026-01-05", "2026-01-06"], _config(tmp_path), run_id="s")
+    assert [i["date"] for i in _sweep_state(tmp_path)["fetch_issues"]] == ["2026-01-05", "2026-01-06"]
+    assert len(written[-1].fetch_issues) == 2   # the report reads the whole sweep
+
+
+@pytest.mark.unit
+def test_a_failed_cell_leaves_the_record_once_a_later_session_logs_it(tmp_path, _offline_curves):
+    _FakeGraph.fail_on = {("NVDA", "2026-01-06")}
+    run_backtest(["NVDA"], ["2026-01-05", "2026-01-06"], _config(tmp_path), run_id="s")
+    assert [f[1] for f in _sweep_state(tmp_path)["failures"]] == ["2026-01-06"]
+    _FakeGraph.fail_on = set()
+    run_backtest(["NVDA"], ["2026-01-05", "2026-01-06"], _config(tmp_path), run_id="s")
+    assert _sweep_state(tmp_path)["failures"] == []
+
+
+@pytest.mark.unit
+def test_a_report_is_written_again_without_running_a_cell(tmp_path, monkeypatch, _offline_curves):
+    import tradingagents.backtest as bt
+    from tradingagents.backtest import rebuild_report
+
+    _issue_on(monkeypatch, {("BTC-USD", "2026-01-05")})
+    run_backtest(["BTC-USD"], ["2026-01-05", "2026-01-06"], _config(tmp_path),
+                 asset_type="crypto", run_id="s")
+    run_dir = tmp_path / "results" / "backtest" / "s"
+    manifest_before = (run_dir / "manifest.json").read_text(encoding="utf-8")
+    (run_dir / "report.html").unlink()
+    graphs_before = len(_FakeGraph.instances)
+
+    readings = []
+    monkeypatch.setattr(bt, "build_curves", lambda entries, config: readings.append(config) or [])
+    result = rebuild_report("s", _config(tmp_path))
+
+    assert result.report_path.exists()
+    assert len(_FakeGraph.instances) == graphs_before           # no graph, no cell run
+    assert (run_dir / "manifest.json").read_text(encoding="utf-8") == manifest_before
+    assert result.metric == _sweep_state(tmp_path)["metric"]    # as scored, not re-inferred
+    assert len(result.fetch_issues) == 1
+    assert readings[0]["holding_period_days"] == 1              # the window the sweep ran with
+    assert "no_coverage" in result.report_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_there_is_no_report_to_rebuild_for_a_sweep_that_never_ran(tmp_path):
+    from tradingagents.backtest import rebuild_report
+
+    with pytest.raises(FileNotFoundError, match="No sweep 'ghost'"):
+        rebuild_report("ghost", _config(tmp_path))

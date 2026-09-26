@@ -24,7 +24,7 @@ import re
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -535,12 +535,108 @@ def run_backtest(
 
     entries = graph.memory_log.load_entries()
     result.curves = build_curves(entries, run_config)
+    state = _record_sweep(run_dir, result, {(e["ticker"], e["date"]) for e in entries})
     try:
         result.report_path = write_html_report(
-            result, summarize(graph.memory_log, result.metric), entries, run_config,
+            _whole_sweep(result, state), summarize(graph.memory_log, result.metric),
+            entries, run_config,
         )
     except Exception as exc:  # a report is a view of the sweep, never its point
         logger.warning("Could not write the backtest report: %s", exc)
+    return result
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _record_sweep(run_dir: Path, result: BacktestResult, logged: set[tuple[str, str]]) -> dict:
+    """Keep what a sweep recorded besides its decisions, across every session.
+
+    Fetch issues and failures lived only in memory: a resumed sweep's report
+    showed the last session's alone, and no report could be written again
+    once the process had exited. Issues accumulate; a failed cell is dropped
+    once a later session has logged it.
+    """
+    path = run_dir / "sweep.json"
+    prior = _read_json(path) or {}
+    failures = {(t, d): reason for t, d, reason in prior.get("failures", [])}
+    failures.update({(t, d): reason for t, d, reason in result.failures})
+    state = {
+        "metric": result.metric,
+        "fetch_issues": prior.get("fetch_issues", []) + result.fetch_issues,
+        "failures": [[t, d, reason] for (t, d), reason in failures.items() if (t, d) not in logged],
+        # Settlement is retried by every session, so only the latest attempt counts.
+        "settlement_failures": [list(f) for f in result.settlement_failures],
+        "manifest_mismatch": sorted(set(prior.get("manifest_mismatch", []))
+                                    | set(result.manifest_mismatch)),
+    }
+    try:
+        path.write_text(json.dumps(state, indent=1, default=str), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not record %s: %s", path, exc)
+    return state
+
+
+def _whole_sweep(result: BacktestResult, state: dict) -> BacktestResult:
+    """This session's result, carrying what every session of the sweep recorded."""
+    return replace(
+        result,
+        fetch_issues=state["fetch_issues"],
+        failures=[tuple(f) for f in state["failures"]],
+        settlement_failures=[tuple(f) for f in state["settlement_failures"]],
+        manifest_mismatch=state["manifest_mismatch"],
+    )
+
+
+def rebuild_report(run_id: str, config: dict) -> BacktestResult:
+    """Write a finished sweep's report again from what it left on disk.
+
+    Nothing is re-run and nothing the sweep recorded is changed: its
+    decisions, the manifest of the conditions they were made under, and its
+    fetch issues are read back as they are. Only the reading is redone with
+    the current code, under the holding window and strategy rule the sweep
+    ran with, so two sweeps' reports can be brought to the same reading.
+    """
+    run_id = safe_ticker_component(run_id)
+    run_dir = Path(config["results_dir"]) / "backtest" / run_id
+    log_path = run_dir / "trading_memory.md"
+    if not log_path.exists():
+        raise FileNotFoundError(f"No sweep '{run_id}' under {run_dir.parent}")
+    manifest = _read_json(run_dir / "manifest.json") or {}
+    state = _read_json(run_dir / "sweep.json") or {}
+    model = manifest.get("model") or {}
+    pipeline = manifest.get("pipeline") or {}
+    strategy = manifest.get("strategy") or {}
+    reading = {
+        **config,
+        "llm_provider": model.get("provider", config.get("llm_provider")),
+        "deep_think_llm": model.get("deep_think_llm", config.get("deep_think_llm")),
+        "quick_think_llm": model.get("quick_think_llm", config.get("quick_think_llm")),
+        "holding_period_days": pipeline.get("holding_period_days", config.get("holding_period_days")),
+        "strategy_positions": strategy.get("positions", config.get("strategy_positions")),
+        "strategy_cost_bps": strategy.get("cost_bps", config.get("strategy_cost_bps")),
+    }
+    memory_log = TradingMemoryLog({"memory_log_path": str(log_path)})
+    entries = memory_log.load_entries()
+    crypto = (manifest.get("grid") or {}).get("asset_type") == "crypto"
+    mismatch = list(state.get("manifest_mismatch", []))
+    if manifest.get("cells_before_manifest") and "unrecorded" not in mismatch:
+        mismatch.insert(0, "unrecorded")
+    result = BacktestResult(
+        run_id=run_id, log_path=log_path, cells_run=len(entries),
+        failures=[tuple(f) for f in state.get("failures", [])],
+        settlement_failures=[tuple(f) for f in state.get("settlement_failures", [])],
+        fetch_issues=state.get("fetch_issues", []),
+        metric=state.get("metric") or ("raw" if crypto else "alpha"),
+        manifest=manifest, manifest_mismatch=mismatch,
+    )
+    result.curves = build_curves(entries, reading)
+    result.report_path = write_html_report(result, summarize(memory_log, result.metric),
+                                           entries, reading)
     return result
 
 

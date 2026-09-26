@@ -94,10 +94,18 @@ def build_curve(entries: list[dict], ticker: str, config: dict,
     so that is the first fill it could have got. A decision with no readable
     rating keeps the position — it is not an order.
 
-    ``until`` ends the curve at that date's close rather than at the latest bar,
-    so a sweep still running can be read up to the cell it has reached.
+    The curve ends where the last decision is judged: ``holding_period_days``
+    bars after it, the same window its outcome is scored over. Without that it
+    ran to whenever the report was written, so two sweeps over the same grid
+    read a different number of days after their last call, and a report
+    written the day after a sweep included a bar still trading. A bar dated
+    today is never used for the same reason.
+
+    ``until`` ends the curve at that date's close instead, so a sweep still
+    running can be read up to the cell it has reached.
     """
-    last = until or get_current_date()
+    today = get_current_date()
+    last = until or today
     signals = sorted(
         (e for e in entries if e["ticker"] == ticker and e.get("date") and e["date"] <= last),
         key=lambda e: e["date"],
@@ -109,10 +117,8 @@ def build_curve(entries: list[dict], ticker: str, config: dict,
     cost_bps = float(config.get("strategy_cost_bps") or 0.0)
 
     prices = load_ohlcv(ticker, last, fill_gaps=False)
-    rows = prices[(prices["Date"] >= signals[0]["date"])
-                  & (prices["Date"] <= last)].reset_index(drop=True)
-    if len(rows) < 2:
-        return None
+    rows = prices[(prices["Date"] >= signals[0]["date"]) & (prices["Date"] <= last)
+                  & (prices["Date"] < today)].reset_index(drop=True)
 
     # A signal lands on the first bar at or after its date, so one dated on a day
     # the asset did not trade still takes effect rather than being dropped.
@@ -121,6 +127,11 @@ def build_curve(entries: list[dict], ticker: str, config: dict,
     for i, bar_date in enumerate(rows["Date"]):
         while pending and pending[0]["date"] <= bar_date.strftime("%Y-%m-%d"):
             by_bar[i] = pending.pop(0)
+    holding = config.get("holding_period_days")
+    if holding and by_bar:
+        rows = rows.iloc[: max(by_bar) + int(holding) + 1]
+    if len(rows) < 2:
+        return None
 
     curve = StrategyCurve(
         ticker=ticker, dates=[rows["Date"].iloc[0].strftime("%Y-%m-%d")],

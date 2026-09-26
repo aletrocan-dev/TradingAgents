@@ -44,7 +44,7 @@ from cli.utils import (
     select_shallow_thinking_agent,
 )
 from tradingagents.agents.utils.rating import is_review
-from tradingagents.backtest import iter_grid, run_backtest, summarize
+from tradingagents.backtest import iter_grid, rebuild_report, run_backtest, summarize
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.analyst_execution import (
@@ -1511,6 +1511,23 @@ def backtest(
         _print_curve_chart(curve)
     if result.report_path:
         console.print(f"HTML report: {result.report_path}")
+
+
+@app.command()
+def report(
+    run_id: str = typer.Argument(..., help="The --run-id of a finished sweep"),
+):
+    """Write a finished sweep's HTML report again, without re-running any cell."""
+    try:
+        result = rebuild_report(run_id, DEFAULT_CONFIG)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from None
+    for curve in result.curves:
+        console.print(curve.render())
+        console.print()
+        _print_curve_chart(curve)
+    console.print(f"HTML report: {result.report_path}")
 
 
 def _duration(seconds: float) -> str:

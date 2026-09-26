@@ -192,3 +192,25 @@ def test_a_start_after_today_is_refused_before_anything_runs(runner):
     result = runner.invoke(m.app, ["backtest", "NVDA", "--start", "2999-01-01", "--end", "2999-01-02"])
     assert result.exit_code == 1
     assert "after today" in result.output
+
+
+@pytest.mark.unit
+def test_report_rewrites_a_finished_sweep_s_report(runner, monkeypatch, tmp_path):
+    asked = []
+    monkeypatch.setattr(m, "rebuild_report", lambda run_id, config: asked.append(run_id) or _Result(tmp_path))
+    result = runner.invoke(m.app, ["report", "btc_3m_finr1"])
+    assert result.exit_code == 0, result.output
+    assert asked == ["btc_3m_finr1"]
+    assert "report.html" in result.output
+    assert calls == []  # no analysis, no sweep
+
+
+@pytest.mark.unit
+def test_report_says_so_when_there_is_no_such_sweep(runner, monkeypatch):
+    def missing(run_id, config):
+        raise FileNotFoundError(f"No sweep '{run_id}' under /results/backtest")
+
+    monkeypatch.setattr(m, "rebuild_report", missing)
+    result = runner.invoke(m.app, ["report", "ghost"])
+    assert result.exit_code == 1
+    assert "No sweep 'ghost'" in result.output

@@ -22,7 +22,7 @@ def _curve(monkeypatch, closes, ratings, until=None):
     frame = pd.DataFrame({"Date": dates, "Close": closes})
     monkeypatch.setattr("tradingagents.strategy_curve.load_ohlcv", lambda *a, **k: frame.copy())
     monkeypatch.setattr("tradingagents.strategy_curve.get_current_date",
-                        lambda: dates[-1].strftime("%Y-%m-%d"))
+                        lambda: (dates[-1] + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
     entries = [{"ticker": "BTC-USD", "date": d.strftime("%Y-%m-%d"), "rating": r}
                for d, r in zip(dates, ratings, strict=False) if r]
     return build_curve(entries, "BTC-USD", {}, until=until)

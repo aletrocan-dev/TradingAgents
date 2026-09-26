@@ -21,8 +21,9 @@ def _prices(monkeypatch):
     monkeypatch.setattr(
         "tradingagents.strategy_curve.load_ohlcv", lambda *a, **k: frame.copy()
     )
+    # The day after the last bar: a bar dated today is still trading.
     monkeypatch.setattr(
-        "tradingagents.strategy_curve.get_current_date", lambda: "2026-01-06"
+        "tradingagents.strategy_curve.get_current_date", lambda: "2026-01-07"
     )
 
 
@@ -125,3 +126,32 @@ def test_drawdown_is_measured_on_each_series():
 def test_the_summary_line_names_both_sides():
     line = build_curve(_entries(("2026-01-01", "Buy"), ("2026-01-03", "Sell")), "BTC-USD", {}).render()
     assert "strategy +10.0%" in line and "buy&hold -5.0%" in line
+
+
+@pytest.mark.unit
+def test_the_curve_ends_where_the_last_decision_is_judged():
+    """Holding one day, the last call (01-03) is judged at 01-04's close: the
+    days after it belong to no decision and must not move either line."""
+    curve = build_curve(_entries(("2026-01-01", "Buy"), ("2026-01-03", "Hold")), "BTC-USD",
+                        {"holding_period_days": 1})
+    assert curve.dates[-1] == "2026-01-04"
+    assert curve.buy_hold_return == pytest.approx(0.05)
+
+
+@pytest.mark.unit
+def test_when_the_report_is_written_does_not_change_the_curve(monkeypatch):
+    """Read the day after the sweep or a week later, the same decisions give
+    the same numbers: that is what makes two sweeps' reports comparable."""
+    config = {"holding_period_days": 1}
+    entries = _entries(("2026-01-01", "Buy"), ("2026-01-02", "Sell"))
+    early = build_curve(entries, "BTC-USD", config)
+    monkeypatch.setattr("tradingagents.strategy_curve.get_current_date", lambda: "2026-03-01")
+    later = build_curve(entries, "BTC-USD", config)
+    assert (early.dates, early.strategy, early.buy_hold) == (later.dates, later.strategy, later.buy_hold)
+
+
+@pytest.mark.unit
+def test_a_bar_still_trading_today_is_left_out(monkeypatch):
+    monkeypatch.setattr("tradingagents.strategy_curve.get_current_date", lambda: "2026-01-06")
+    curve = build_curve(_entries(("2026-01-01", "Hold")), "BTC-USD", {})
+    assert curve.dates[-1] == "2026-01-05"
